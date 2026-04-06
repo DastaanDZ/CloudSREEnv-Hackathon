@@ -1,0 +1,59 @@
+name: CloudSREEnv
+version: "1.0.0"
+description: >
+  An OpenEnv-compliant Kubernetes-style cloud infrastructure simulator where
+  an AI agent acts as a Site Reliability Engineer (SRE) to diagnose and fix
+  service issues across three escalating tasks.
+
+author: CloudSRE-OpenEnv Team
+license: MIT
+
+environment:
+  entrypoint: env.py
+  class: CloudSREEnv
+  port: 8000
+
+tasks:
+  - id: task1_status_audit
+    name: "Status Audit"
+    difficulty: easy
+    description: >
+      Identify which service is down. The agent must call LIST_SERVICES to
+      discover the cluster state, then call GET_LOGS on the failing service.
+    success_criteria: >
+      Agent's last action is GET_LOGS targeting the service in Error status.
+    max_steps: 10
+    scenario: crash_loop
+
+  - id: task2_self_healing
+    name: "Self-Healing"
+    difficulty: medium
+    description: >
+      Restore a crashed service back to Running state. The agent must diagnose
+      the issue and issue a RESTART command on the failing service.
+    success_criteria: >
+      service.status == "Running" after an Error state was detected.
+    max_steps: 15
+    scenario: crash_loop
+
+  - id: task3_latency_resolution
+    name: "Latency Resolution"
+    difficulty: hard
+    description: >
+      Detect high latency on auth-api caused by CPU under-provisioning under
+      high traffic and increase CPU allocation to resolve it.
+    success_criteria: >
+      service.cpu_allocated >= 2048 AND service.latency_ms < 100
+    max_steps: 20
+    scenario: performance_bottleneck
+
+reward_shaping:
+  useful_diagnostic: +0.1
+  hallucinated_service: -0.2
+  unnecessary_restart: -0.5
+  task_completion: +1.0
+
+constraints:
+  memory_limit_gb: 8
+  max_runtime_minutes: 20
+  deterministic_graders: true
