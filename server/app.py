@@ -66,6 +66,7 @@ class Service:
         memory_allocated: int = 1024,
         latency_ms: int = 30,
         logs: Optional[List[str]] = None,
+        error_message: str = "", # NEW: Track cascading errors
     ):
         self.id = id
         self.status = status
@@ -73,6 +74,7 @@ class Service:
         self.memory_allocated = memory_allocated
         self.latency_ms = latency_ms
         self.logs: List[str] = logs or []
+        self.error_message = error_message # NEW
 
     def to_metrics(self) -> ServiceMetrics:
         return ServiceMetrics(
@@ -105,6 +107,28 @@ class MockCloud:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _propagate_failures(self):
+        """Propagates health and latency issues while resetting baselines."""
+        # Reset transient states
+        baselines = {"auth-api": 28, "payment-db": 12, "inventory-svc": 45, "notification-worker": 60}
+        for svc_id, svc in self.services.items():
+            svc.error_message = ""
+            # Reset to baseline so penalties don't stack infinitely
+            if svc.status == "Running":
+                svc.latency_ms = baselines.get(svc_id, 30)
+
+        deps = {"auth-api": "payment-db", "inventory-svc": "payment-db", "notification-worker": "inventory-svc"}
+
+        for dependent, provider_id in deps.items():
+            provider = self.services[provider_id]
+            dep_svc = self.services[dependent]
+
+            if provider.status == "Error":
+                dep_svc.error_message = f"Critical: 503 Service Unavailable - Upstream {provider_id} is down."
+            elif provider.latency_ms > 200:
+                dep_svc.latency_ms += int(provider.latency_ms * 0.5)
+                dep_svc.error_message = f"Warning: Upstream {provider_id} is slow."
 
     def _build_default_services(self):
         self.services = {
@@ -158,15 +182,15 @@ class MockCloud:
     def _apply_performance_bottleneck(self):
         self.rps = self.RPS_HIGH
         svc = self.services["auth-api"]
-        svc.cpu_allocated = 128          # Under-provisioned
-        svc.latency_ms = 850             # Spiked
+        svc.cpu_allocated = 128
+        svc.latency_ms = 850
         svc.logs = [
             "[INFO] auth-api started",
             f"[WARN] RPS={self.rps} — CPU throttling detected",
-            "[WARN] Request queue depth: 2048",
-            "[ERROR] p99 latency=850ms exceeds SLO threshold (200ms)",
-            "[ERROR] CPU usage 99.8% — scaling required",
+            "[ERROR] CPU usage 99.8% — ROOT CAUSE: Scaling to at least 2048m required", # Added "ROOT CAUSE"
         ]
+        # Ensure propagation is clear
+        self._propagate_failures()
 
     def reset(self, scenario: Optional[str] = None) -> str:
         """Randomly (or explicitly) set a failure scenario."""
@@ -180,6 +204,7 @@ class MockCloud:
         elif scenario == "performance_bottleneck":
             self._apply_performance_bottleneck()
 
+        self._propagate_failures()
         return scenario
 
     def get_all_metrics(self) -> List[ServiceMetrics]:
@@ -308,49 +333,42 @@ class CloudSREEnv:
 
             elif action.action_type == ActionType.GET_LOGS:
                 svc = self.cloud.services[service_id]
-                logs = "\n".join(svc.logs) if svc.logs else "(no logs)"
-                obs_text = f"=== Logs: {service_id} ===\n{logs}"
+                
+                # NEW: Check for cascading error messages first
+                if svc.error_message:
+                    obs_text = f"=== Logs: {service_id} ===\n[ERROR] {svc.error_message}"
+                else:
+                    logs = "\n".join(svc.logs) if svc.logs else "(no logs)"
+                    obs_text = f"=== Logs: {service_id} ===\n{logs}"
+                
                 reward_val = 0.1
                 reward_reason = "useful_diagnostic"
 
             elif action.action_type == ActionType.RESTART:
                 svc = self.cloud.services[service_id]
                 if svc.status == "Running":
-                    obs_text = f"[WARN] {service_id} is already Running. Unnecessary restart triggered."
+                    obs_text = f"[WARN] {service_id} is already Running."
                     reward_val = -0.5
-                    reward_reason = "unnecessary_restart"
                 else:
                     svc.status = "Running"
-                    svc.latency_ms = 35
-                    svc.logs.append("[INFO] Container restarted successfully by SRE agent.")
+                    self.cloud._propagate_failures() # Correctly inside the success block
                     obs_text = f"[OK] {service_id} restarted. Status: Running."
                     reward_val = 0.0
-                    reward_reason = "restart_executed"
 
             elif action.action_type == ActionType.SCALE:
                 cpu_value = action.cpu_value
                 if cpu_value is None or cpu_value <= 0:
-                    obs_text = "[ERROR] Invalid cpu_value. Must be a positive integer."
+                    obs_text = "[ERROR] Invalid cpu_value."
                     reward_val = -0.2
-                    reward_reason = "invalid_cpu_value"
-                    error_msg = "Invalid cpu_value"
                 else:
                     svc = self.cloud.services[service_id]
                     old_cpu = svc.cpu_allocated
                     svc.cpu_allocated = cpu_value
                     if cpu_value >= 2048:
                         svc.latency_ms = 45
-                    
-                    # NEW: Add a hint if the service is still crashed
-                    status_hint = ""
-                    if svc.status == "Error":
-                        status_hint = " Note: Service is still in Error state and needs a RESTART."
-                    
-                    obs_text = (
-                        f"[OK] {service_id} scaled: CPU {old_cpu}m → {cpu_value}m.{status_hint}"
-                    )
+                    self.cloud._propagate_failures() # Correctly inside the success block
+                    obs_text = f"[OK] {service_id} scaled: CPU {old_cpu}m → {cpu_value}m."
                     reward_val = 0.0
-                    reward_reason = "scale_executed"
 
         # ---- Grader ----------------------------------------------------
         task_done, task_score = self._grade()

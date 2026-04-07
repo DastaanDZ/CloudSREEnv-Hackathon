@@ -11,224 +11,110 @@ tags:
 
 # CloudSREEnv 🛠️
 
-> **OpenEnv × Meta Developers Hackathon**  
-> An OpenEnv-compliant Kubernetes-style SRE simulator powered by an LLM agent.
+> **OpenEnv × Meta Developers Hackathon Submission**
+> An advanced, OpenEnv-compliant SRE simulator featuring cascading failure logic and Root Cause Analysis (RCA) challenges.
 
 ---
 
 ## 💡 Motivation
-
-Standard LLM benchmarks often focus on static text or simple games. `CloudSREEnv` addresses **Real-World Utility** (30% scoring weight) by simulating a task humans actually do: Site Reliability Engineering. It forces agents to bridge the gap between "reasoning" and "system action" by requiring them to interpret raw system logs and execute stateful commands to resolve infrastructure failures.
-
----
-
-## Overview
-
-`CloudSREEnv` simulates a small cloud cluster of four microservices. On each episode reset, the environment randomly triggers one of three real-world failure scenarios. An AI agent acting as a Site Reliability Engineer must diagnose and repair the cluster using typed actions.
-
-```
-auth-api  ·  payment-db  ·  inventory-svc  ·  notification-worker
-```
+Standard LLM benchmarks often focus on isolated text tasks. `CloudSREEnv` addresses **Real-World Utility** (30% scoring weight) by simulating complex microservice dependencies. It forces agents to move beyond simple "restarts" and perform true **Root Cause Analysis** by tracing performance bottlenecks across a distributed system.
 
 ---
 
-## Project Structure
-
-```
+## 🏗️ Project Structure
+This project follows the canonical OpenEnv multi-mode deployment structure:
+```text
 CloudSREEnv/
-├── openenv.yaml      # Environment metadata & task definitions
-├── env.py            # Core OpenEnv implementation (MockCloud + CloudSREEnv)
-├── inference.py      # Baseline LLM agent (OpenAI-compatible)
-├── requirements.txt  # Python dependencies
-├── Dockerfile        # Container definition
-└── README.md
+├── server/
+│   ├── app.py        # Core logic (MockCloud + CloudSREEnv)
+│   └── __init__.py   # Python package marker
+├── pyproject.toml    # Project metadata & entry points
+├── uv.lock           # Deterministic dependency lockfile
+├── openenv.yaml      # Environment metadata
+├── inference.py      # RCA-optimized Baseline Agent
+├── Dockerfile        # uv-based container definition
+└── README.md         # Documentation
 ```
 
 ---
 
-## Scenarios & Tasks
+## 🔗 Service Dependency Graph
+Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue at the base of the stack propagates upward:
+- **auth-api** ⮕ depends on ⮕ **payment-db**
+- **inventory-svc** ⮕ depends on ⮕ **payment-db**
+- **notification-worker** ⮕ depends on ⮕ **inventory-svc**
 
-The environment simulates a cluster of four microservices: `auth-api`, `payment-db`, `inventory-svc`, and `notification-worker`. On reset, it triggers one of three escalating scenarios:
+*Example: If `payment-db` is slow, `auth-api` will report "Upstream Slowness" in its logs, requiring the agent to trace the bottleneck to the database.*
+
+---
+
+## 🎯 Scenarios & Tasks
 
 | Task | Difficulty | Scenario | Success Condition |
 |------|-----------|----------|-------------------|
-| Status Audit | Easy | CrashLoopBackOff | Last action is `GET_LOGS` on failing service |
-| Self-Healing | Medium | CrashLoopBackOff | Failing service status → `Running` |
-| Latency Resolution | Hard | Performance Bottleneck | `cpu_allocated ≥ 2048` AND `latency_ms < 100` |
-
-### Reward Shaping
-
-| Event | Δ Reward |
-|-------|---------|
-| `LIST_SERVICES` (useful diagnostic) | +0.1 |
-| Hallucinated service ID | −0.2 |
-| Restart already-Running service | −0.5 |
-| Task completion | +1.0 |
+| **Status Audit** | Easy | Cascading Crash | Trace 503 error from API to DB logs |
+| **Self-Healing** | Medium | DB Recovery | Restore DB health to fix entire cluster |
+| **RCA & Scaling** | Hard | Latency Bottleneck | Scale the DB (root cause) to fix worker latency |
 
 ---
 
 ## 🕹️ Observation & Action Spaces
 
 ### Action Space (Inputs)
-The agent interacts with the cluster using typed JSON actions:
 - `LIST_SERVICES`: Returns a status table of all pods.
-- `GET_LOGS(service_id)`: Fetches recent logs (e.g., OOMKilled errors).
-- `RESTART(service_id)`: Restores a crashed service to `Running`.
-- `SCALE(service_id, cpu_value)`: Modifies CPU allocation to resolve bottlenecks.
+- `GET_LOGS(service_id)`: Fetches logs (includes cascading error propagation).
+- `RESTART(service_id)`: Restores a crashed pod.
+- `SCALE(service_id, cpu_value)`: Modifies CPU (Success: `cpu >= 2048`).
 
 ### Observation Space (Outputs)
-Each step returns a structured observation:
-- `text_output`: Human-readable terminal responses (logs, tables, or error messages).
-- `structured_data`: A Pydantic-validated list of `ServiceMetrics` including Status, CPU, Memory, and Latency.
+- `text_output`: Human-readable terminal logs and status tables.
+- `structured_data`: Pydantic-validated `ServiceMetrics` (Status, CPU, Memory, Latency).
 
 ---
 
-## 📈 Baseline Performance
-The provided `inference.py` script serves as the reproducible baseline. 
+## 🚀 Quick Start (Local)
 
-**Expected Output Format:**
-```text
-[START] task=T1-status-audit env=CloudSRE model=gpt-5-nano
-[STEP]  step=1 action=LIST_SERVICES reward=0.10 done=False error=none
-[STEP]  step=2 action=GET_LOGS(payment-db) reward=1.00 done=True error=none
-[END]   success=True steps=2 rewards=0.10,1.00
+### 1. Setup with `uv`
+```bash
+pip install uv
+uv sync
 ```
 
----
-
-## Quick Start
-
-### 1. Install dependencies
-
+### 2. Run Environment Server
 ```bash
-pip install -r requirements.txt
-```
-
-### 2. Run the environment server
-
-```bash
-python env.py
+uv run server
 # Serving on http://0.0.0.0:8000
 ```
 
-### 3. Run the baseline agent
-
+### 3. Run RCA Agent
 ```bash
-export API_BASE_URL="https://api.openai.com/v1"
-export MODEL_NAME="gpt-4o-mini"
-export HF_TOKEN="sk-..."
+export API_BASE_URL="https://aipipe.org/v1"
+export MODEL_NAME="meta-llama/Llama-3-70b-Instruct"
+export HF_TOKEN="your_scaler_jwt"
 
 python inference.py
 ```
 
-Expected STDOUT:
-
-```
-[START] task=T1-status-audit env=CloudSRE model=gpt-4o-mini
-[STEP]  step=1 action=LIST_SERVICES reward=0.10 done=False error=none
-[STEP]  step=2 action=GET_LOGS(payment-db) reward=1.10 done=True error=none
-[END]   success=True steps=2 rewards=0.10,1.10
-```
-
 ---
 
-## Docker
-
-### Build
+## 🐳 Docker Deployment
+This environment is containerized using `uv` for high-performance builds.
 
 ```bash
-docker build -t cloudsreenv:latest .
-```
+# Build
+docker build -t cloudsreenv .
 
-### Run server
-
-```bash
-docker run -p 8000:8000 cloudsreenv:latest
-```
-
-### Run inference
-
-```bash
-docker run \
-  -e API_BASE_URL="https://api.openai.com/v1" \
-  -e MODEL_NAME="gpt-4o-mini" \
-  -e HF_TOKEN="sk-..." \
-  cloudsreenv:latest \
-  python inference.py
+# Run
+docker run -p 8000:8000 cloudsreenv
 ```
 
 ---
 
-## HTTP API (OpenEnv)
-
-| Method | Path | Body | Description |
-|--------|------|------|-------------|
-| POST | `/reset` | `?task_id=...` | Start new episode |
-| POST | `/step` | `Action` JSON | Execute one action |
-| GET | `/state` | — | Current environment state |
-| GET | `/health` | — | Liveness check |
-
-### Example curl
-
-```bash
-# Reset
-curl -X POST "http://localhost:8000/reset?task_id=task1_status_audit"
-
-# Step
-curl -X POST http://localhost:8000/step \
-  -H "Content-Type: application/json" \
-  -d '{"action_type": "LIST_SERVICES"}'
-
-# State
-curl http://localhost:8000/state
-```
+## ⚖️ Evaluation Compliance
+- **Real-World Utility:** Models genuine microservice cascading failures.
+- **Deterministic Graders:** 100% logic-based scoring (no LLM variance).
+- **Spec Compliance:** Fully compatible with `openenv validate` and `openenv serve`.
+- **Infrastructure:** Optimized for 8GB RAM / 2 vCPU limits.
 
 ---
-
-## Action Schema
-
-```json
-// List all services
-{"action_type": "LIST_SERVICES"}
-
-// Get pod logs
-{"action_type": "GET_LOGS", "service_id": "payment-db"}
-
-// Restart a crashed pod
-{"action_type": "RESTART", "service_id": "payment-db"}
-
-// Scale CPU for a service
-{"action_type": "SCALE", "service_id": "auth-api", "cpu_value": 2048}
-```
-
----
-
-## Constraints
-
-- Memory: Python process stays well under 8 GB  
-- Runtime: All 3 tasks complete in under 20 minutes  
-- Graders: 100% deterministic — no LLMs used for scoring  
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   CloudSREEnv                        │
-│                                                     │
-│  ┌─────────────┐    step(Action)     ┌───────────┐  │
-│  │  LLM Agent  │ ──────────────────► │   env.py  │  │
-│  │ inference.py│ ◄────────────────── │ CloudSREEnv│  │
-│  └─────────────┘  (Obs, Reward, done)└─────┬─────┘  │
-│                                            │        │
-│                                    ┌───────▼──────┐ │
-│                                    │  MockCloud   │ │
-│                                    │  (Services)  │ │
-│                                    └──────────────┘ │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-*Built for OpenEnv × Meta Developers Hackathon*
+*Built for the OpenEnv × Meta Developers Hackathon 2026*
