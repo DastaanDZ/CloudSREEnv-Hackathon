@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 
-from env import Action, ActionType, CloudSREEnv
+from server.app import Action, ActionType, CloudSREEnv
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -505,3 +505,12 @@ if __name__ == "__main__":
         obs, rew, done, info = env.step(act)
         print(obs.text_output)
         print(f"Reward: {rew.value}  Done: {done}")
+
+def main():
+    import uvicorn
+    app_instance, _ = create_app()
+    if app_instance:
+        uvicorn.run(app_instance, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    main()

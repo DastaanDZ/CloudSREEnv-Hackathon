@@ -9,7 +9,7 @@ author: CloudSRE-OpenEnv Team
 license: MIT
 
 environment:
-  entrypoint: env.py
+  entrypoint: server/app.py
   class: CloudSREEnv
   port: 8000
 
