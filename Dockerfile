@@ -7,41 +7,42 @@ LABEL maintainer="CloudSRE-OpenEnv Team"
 LABEL description="OpenEnv-compliant SRE simulator for Kubernetes-style cloud infrastructure"
 LABEL version="1.0.0"
 
-# ── System dependencies ──────────────────────────────────────────────────────
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python dependencies ──────────────────────────────────────────────────────
+# Install uv (Required for OpenEnv multi-mode deployment)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# 1. Copy dependency files first for layer caching
+COPY pyproject.toml uv.lock ./
 
-# ── Application files ────────────────────────────────────────────────────────
-COPY openenv.yaml ./
-COPY env.py       ./
-COPY inference.py ./
+# 2. Install dependencies (into a virtual env inside the container)
+RUN uv sync --frozen --no-install-project
 
-# ── Environment variables (override at runtime) ──────────────────────────────
-# API_BASE_URL : OpenAI-compatible endpoint
-# MODEL_NAME   : LLM to use for inference
-# HF_TOKEN     : Bearer token (Hugging Face / OpenAI key)
-ENV API_BASE_URL="https://api.openai.com/v1" \
-    MODEL_NAME="gpt-4o-mini" \
-    HF_TOKEN="" \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+# 3. Copy application code and metadata
+# Note: We copy the 'server' folder which now contains app.py
+COPY openenv.yaml README.md inference.py ./
+COPY server/ ./server/
 
-# ── OpenEnv HTTP port ────────────────────────────────────────────────────────
+# 4. Finalize project installation
+RUN uv sync --frozen
+
+# Environment setup
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+# OpenEnv standard port
 EXPOSE 8000
 
-# ── Health check ─────────────────────────────────────────────────────────────
+# Healthcheck for the CloudSRE server
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# ── Default: start the OpenEnv HTTP server ───────────────────────────────────
-# Override CMD to run inference instead:
-#   docker run ... python inference.py
-CMD ["python", "env.py"]
+# Start the server using the entry point defined in pyproject.toml
+CMD ["uv", "run", "server"]
