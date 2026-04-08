@@ -304,32 +304,58 @@ class CloudSREEnv:
 # HTTP Shim
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# OpenEnv HTTP shim (serves /step, /reset, /state on port 8000)
+# ---------------------------------------------------------------------------
+
 def create_app():
+    """Returns the FastAPI app and uvicorn module."""
     try:
         from fastapi import FastAPI
         from fastapi.responses import JSONResponse
         import uvicorn
-        app = FastAPI(title="CloudSREEnv")
+
+        app = FastAPI(title="CloudSREEnv", version="1.0.0")
         env = CloudSREEnv()
 
         @app.post("/reset")
         def api_reset(task_id: Optional[str] = None, scenario: Optional[str] = None):
-            return JSONResponse(env.reset(task_id=task_id, scenario=scenario).dict())
+            obs = env.reset(task_id=task_id, scenario=scenario)
+            return JSONResponse(obs.dict())
 
         @app.post("/step")
         def api_step(action: Action):
             obs, reward, done, info = env.step(action)
-            return JSONResponse({"observation": obs.dict(), "reward": reward.dict(), "done": done, "info": info})
+            return JSONResponse({
+                "observation": obs.dict(),
+                "reward": reward.dict(),
+                "done": done,
+                "info": info,
+            })
 
         @app.get("/state")
-        def api_state(): return JSONResponse(env.state())
+        def api_state():
+            return JSONResponse(env.state())
 
         @app.get("/health")
-        def health(): return {"status": "ok"}
+        def health():
+            return {"status": "ok", "env": "CloudSREEnv"}
 
         return app, uvicorn
-    except ImportError: return None, None
+
+    except ImportError:
+        return None, None
+
+# IMPORTANT: This function must be at the top level (no indentation)
+def main():
+    """The entry point for the 'server' command."""
+    import uvicorn
+    app_instance, _ = create_app()
+    if app_instance:
+        # Use host 0.0.0.0 for Docker/Cloud compatibility
+        uvicorn.run(app_instance, host="0.0.0.0", port=8000)
+    else:
+        print("[ERROR] FastAPI or Uvicorn not installed. Cannot start server.")
 
 if __name__ == "__main__":
-    app, uvicorn = create_app()
-    if app and uvicorn: uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
