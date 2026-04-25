@@ -12,16 +12,17 @@ environment:
   port: 8000
 
 tasks:
-  - id: task1_status_audit
-    name: "System Triage"
+  - id: task1_tls_certificate_rca
+    name: "TLS Certificate Expiry RCA"
     difficulty: easy
     description: >
-      Identify the service in Error state. The agent must discover the 
-      cluster state and inspect the logs of the failing pod.
+      Investigate TLS handshake failures on auth-api. The agent must discover
+      the expired certificate issue through logs. No local remediation available.
     success_criteria: >
-      Final score 0.90: Agent performs GET_LOGS on the failing payment-db.
+      Final score 0.80: Agent performs GET_LOGS on auth-api and identifies
+      certificate expiry without attempting RESTART or SCALE.
     max_steps: 10
-    scenario: crash_loop
+    scenario: tls_certificate_expiry
 
   - id: task2_self_healing
     name: "Automated Recovery"

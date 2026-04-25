@@ -67,51 +67,56 @@ PROMPTS = {
 # The model must learn to handle accumulated multi-turn context.
 SCENARIO_MESSAGES = {
     "IC": [
-        # Turn 1: Initial alerts (IC sees this first)
+        # Task1: TLS Certificate Expiry (investigation only, no fix needed)
+        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api reporting TLS handshake failures.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api TLS errors detected. Users unable to login.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api reporting TLS handshake failures.\nNew message from L1_Triage: Root cause found. auth-api has expired upstream certificate. No local fix available.",
+        
+        # Task2: payment-db crash (needs RESTART)
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] High latency (850ms) detected on auth-api.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] Multiple services reporting upstream failures.",
-        
-        # Turn 3: After L1 investigated and reported back
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: Root cause found. payment-db is in CrashLoopBackOff with OOMKilled error.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api at 99.8% CPU. Needs scaling.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] Services failing.\nNew message from L1_Triage: payment-db crashed, causing cascading failures to inventory-svc.",
-        
-        # Turn 5: After L2 applied fix
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db Error.\nNew message from L1_Triage: payment-db OOMKilled.\nNew message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
+        
+        # Task3: High latency (needs SCALE)
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency (850ms) detected on auth-api.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api at 99.8% CPU. Needs scaling.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency.\nNew message from L1_Triage: auth-api overloaded.\nNew message from L2_DB_SME: auth-api scaled to 2048 CPU. Latency resolved.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] Cascading failures.\nNew message from L2_DB_SME: payment-db restarted. All services recovering.",
     ],
     "L1_Triage": [
-        # Turn 2: IC delegated investigation - should LIST_SERVICES or GET_LOGS
+        # Initial investigation prompts
         "New message from IC: Investigate the cluster status. Find what's causing the alert.",
-        "New message from IC: We have an incident with payment-db. Check it out.",
+        "New message from IC: Users reporting TLS errors. Check auth-api.",
         "New message from IC: Users reporting errors. Investigate and report back.",
         
         # After LIST_SERVICES - should GET_LOGS on suspicious service
+        "New message from IC: Investigate.\nObs: auth-api              Running    45ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",
         "New message from IC: Investigate.\nObs: auth-api              Running    45ms\npayment-db            Error      0ms\ninventory-svc         Running    120ms",
         
-        # CRITICAL: After GET_LOGS - should MESSAGE_CHANNEL to IC with findings
+        # Task1: TLS Certificate logs - should MESSAGE_CHANNEL to IC (no fix needed)
+        "New message from IC: Check auth-api.\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[ERROR] x509: certificate signed by unknown authority",
+        "New message from IC: Investigate TLS issues.\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[WARN] Upstream certificate expired 2 days ago",
+        
+        # Task2: payment-db crash logs
         "New message from IC: Check payment-db.\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff",
+        
+        # Task3: High CPU logs
         "New message from IC: Check auth-api.\nObs: === Logs: auth-api ===\n[WARN] RPS=3500 — CPU usage 99.8%",
-        "New message from IC: Investigate.\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled",
-        "New message from IC: Check logs.\nObs: === Logs: inventory-svc ===\nCritical: 503 Service Unavailable - Upstream payment-db is down.",
         
         # Explicit "you have logs, now report" scenarios
+        "New message from IC: What did you find?\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[SYSTEM] Certificate issue identified. Report to IC.",
         "New message from IC: What did you find?\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff\n[SYSTEM] You have the logs. Report findings to IC.",
         "New message from IC: Status?\nObs: auth-api at 99.8% CPU. High latency detected.\n[SYSTEM] Investigation complete. Message IC with your findings.",
-        "New message from IC: Report back.\nObs: payment-db crashed with OOMKilled. Root cause identified.",
     ],
     "L2_DB_SME": [
-        # Turn 4: IC delegated fix to L2
+        # Task2: payment-db crash fix
         "New message from IC: payment-db is crashed. Restart it to recover.",
         "New message from IC: L1 found payment-db OOMKilled. Apply RESTART to payment-db.",
-        "New message from IC: auth-api needs more resources. Scale it to 2048 CPU.",
         "New message from IC: Database crashed. Fix payment-db immediately.",
-        "New message from IC: High CPU on auth-api causing latency. Scale auth-api.",
-        
-        # With observation context
         "New message from IC: Fix the database.\nObs: payment-db is in Error state with OOMKilled.",
+        
+        # Task3: auth-api scaling fix
+        "New message from IC: auth-api needs more resources. Scale it to 2048 CPU.",
+        "New message from IC: High CPU on auth-api causing latency. Scale auth-api.",
         "New message from IC: Resolve the performance issue.\nObs: auth-api at 99.8% CPU, latency 850ms.",
     ],
 }

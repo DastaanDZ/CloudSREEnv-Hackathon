@@ -52,7 +52,7 @@ Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue a
 
 | Task | Difficulty | Scenario | Success Condition |
 |------|-----------|----------|-------------------|
-| **Status Audit** | Easy | Cascading Crash | Trace 503 error from API to DB logs |
+| **TLS Certificate RCA** | Easy | Certificate Expiry | Identify expired cert in auth-api logs (no fix needed) |
 | **Self-Healing** | Medium | DB Recovery | Restore DB health to fix entire cluster |
 | **RCA & Scaling** | Hard | Latency Bottleneck | Scale the DB (root cause) to fix worker latency |
 

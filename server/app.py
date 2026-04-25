@@ -96,6 +96,8 @@ class MockCloud:
             self._apply_crash_loop()
         elif scenario == "performance_bottleneck":
             self._apply_performance_bottleneck()
+        elif scenario == "tls_certificate_expiry":
+            self._apply_tls_certificate_expiry()
 
         self._propagate_failures()
 
@@ -113,6 +115,17 @@ class MockCloud:
         svc.latency_ms = 850
         svc.logs = [f"[WARN] RPS={self.rps} — CPU usage 99.8%"]
         self.incident_channel.append("[SYSTEM ALERT] High latency (850ms) detected on auth-api.")
+
+    def _apply_tls_certificate_expiry(self):
+        svc = self.services["auth-api"]
+        svc.status = "Running"
+        svc.latency_ms = 45
+        svc.logs = [
+            "[ERROR] TLS handshake failed: certificate has expired",
+            "[ERROR] x509: certificate signed by unknown authority",
+            "[WARN] Upstream certificate expired 2 days ago"
+        ]
+        self.incident_channel.append("[SYSTEM ALERT] auth-api reporting TLS handshake failures.")
 
     def _propagate_failures(self):
         deps = {
@@ -146,12 +159,14 @@ class CloudSREEnv:
         self.max_steps = 15 # RL needs a strict cutoff
 
     def reset(self, task_id: Optional[str] = None, scenario: Optional[str] = None) -> Observation:
-        self.current_task = task_id or "task1_status_audit"
+        self.current_task = task_id or "task1_tls_certificate_rca"
         self.action_history.clear()
         self.done = False
         self.steps_taken = 0
 
-        if "task1" in self.current_task or "task2" in self.current_task:
+        if "task1" in self.current_task:
+            self.cloud.reset(scenario="tls_certificate_expiry")
+        elif "task2" in self.current_task:
             self.cloud.reset(scenario="crash_loop")
         elif "task3" in self.current_task:
             self.cloud.reset(scenario="performance_bottleneck")
@@ -207,14 +222,19 @@ class CloudSREEnv:
                 obs_text = f"[OK] {action.service_id} restarted by {action.agent_id}."
 
         elif action.action_type == ActionType.SCALE:
-            svc = self.cloud.services.get(action.service_id)
-            if svc:
-                svc.cpu_allocated = action.cpu_value
-                if action.cpu_value >= 2048:
-                    svc.latency_ms = 45 if svc.id != "payment-db" else 12
-                    svc.logs = ["[INFO] Scaled successfully."]
-                    self.cloud._propagate_failures()
-                obs_text = f"[OK] {action.service_id} scaled to {action.cpu_value}m CPU."
+            if action.cpu_value is None:
+                obs_text = "[ERROR] SCALE requires cpu_value parameter."
+                total_reward -= 0.2
+                breakdown["missing_param_penalty"] = -0.2
+            else:
+                svc = self.cloud.services.get(action.service_id)
+                if svc:
+                    svc.cpu_allocated = action.cpu_value
+                    if action.cpu_value >= 2048:
+                        svc.latency_ms = 45 if svc.id != "payment-db" else 12
+                        svc.logs = ["[INFO] Scaled successfully."]
+                        self.cloud._propagate_failures()
+                    obs_text = f"[OK] {action.service_id} scaled to {action.cpu_value}m CPU."
 
         elif action.action_type == ActionType.MESSAGE_CHANNEL:
             msg = f"[{action.agent_id} -> {action.target}]: {action.message}"
@@ -250,12 +270,14 @@ class CloudSREEnv:
             return -0.5, {"syntax_penalty": -0.5}, "Invalid JSON format."
 
         # 2. Duplicate Action Penalty (penalize same action by same agent)
-        if len(self.action_history) >= 1:
-            last_action = self.action_history[-1]
+        # Note: Current action is already appended to history, so compare with [-2]
+        if len(self.action_history) >= 2:
+            prev_action = self.action_history[-2]
             is_duplicate = (
-                last_action.action_type == action.action_type and
-                last_action.agent_id == action.agent_id and
-                last_action.service_id == action.service_id
+                prev_action.action_type == action.action_type and
+                prev_action.agent_id == action.agent_id and
+                prev_action.service_id == action.service_id and
+                prev_action.target == action.target
             )
             if is_duplicate:
                 reward -= 0.15
@@ -293,8 +315,10 @@ class CloudSREEnv:
     def _grade_terminal_state(self) -> tuple[bool, float]:
         """Evaluates if the final state matches the scenario objective."""
         if "task1" in self.current_task:
-            found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "payment-db" for a in self.action_history)
-            return (True, 0.8) if found_logs else (False, 0.0)
+            # TLS Certificate RCA: GET_LOGS(auth-api) happened AND no RESTART/SCALE
+            found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api" for a in self.action_history)
+            no_remediation = not any(a.action_type in [ActionType.RESTART, ActionType.SCALE] for a in self.action_history)
+            return (True, 0.8) if (found_logs and no_remediation) else (False, 0.0)
             
         elif "task2" in self.current_task:
             return (True, 0.9) if self.cloud.services["payment-db"].status == "Running" else (False, 0.0)

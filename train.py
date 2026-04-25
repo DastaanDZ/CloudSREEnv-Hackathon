@@ -318,23 +318,27 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             env = CloudSREEnv()
             
             # Select scenario based on prompt context
-            if "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
+            if "tls" in prompt_lower or "certificate" in prompt_lower or "handshake" in prompt_lower:
+                env.reset(task_id="task1_tls_certificate_rca")
+            elif "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
                 env.reset(task_id="task2_self_healing")
             elif "latency" in prompt_lower or "slow" in prompt_lower or "cpu" in prompt_lower:
                 env.reset(task_id="task3_latency_resolution")
             else:
-                env.reset(task_id="task1_status_audit")
+                env.reset(task_id="task1_tls_certificate_rca")
             
-            # Execute action in environment
+            # Replay prior actions to sync env state with prompt context
+            _prepare_env_for_prompt(env, prompt_lower)
+            
+            # Execute action in environment (now env state matches prompt)
             action = Action(**action_dict)
             _, reward_obj, done, _ = env.step(action)
             
-            # Accumulate ALL environment rewards (will be weighted at 70%)
-            for component, value in reward_obj.breakdown.items():
-                env_reward += value
+            # Use the canonical env reward (already capped to [-1, 1] per OpenEnv spec)
+            env_reward = float(reward_obj.value)
             
             # Task completion is a strong env signal
-            if done and reward_obj.value > 0:
+            if done and env_reward > 0:
                 env_reward += 0.5
                 
         except Exception:
@@ -362,6 +366,55 @@ def sre_rubric_reward(prompts, completions, **kwargs):
     return rewards
 
 
+def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
+    """
+    Replay prior actions to sync env state with prompt context.
+    
+    This makes the env's internal state (cloud status, action_history, steps_taken)
+    match what the prompt describes, so scoring is accurate.
+    """
+    # Replay LIST_SERVICES if prompt contains service listing output
+    if any(svc in prompt_lower for svc in ["auth-api", "payment-db", "inventory-svc"]) and "running" in prompt_lower:
+        try:
+            env.step(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
+        except Exception:
+            pass
+    
+    # Replay GET_LOGS if prompt contains log output (indicates prior GET_LOGS action)
+    if "=== logs:" in prompt_lower or "oomkilled" in prompt_lower or "error:" in prompt_lower or "tls" in prompt_lower or "certificate" in prompt_lower:
+        if "payment-db" in prompt_lower:
+            try:
+                env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
+            except Exception:
+                pass
+        if "auth-api" in prompt_lower and ("cpu" in prompt_lower or "rps" in prompt_lower or "latency" in prompt_lower or "tls" in prompt_lower or "certificate" in prompt_lower or "handshake" in prompt_lower):
+            try:
+                env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+            except Exception:
+                pass
+    
+    # Replay RESTART if prompt says service was restarted (L2_DB_SME is authorized)
+    if "restarted" in prompt_lower:
+        if "payment-db" in prompt_lower:
+            try:
+                env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id="payment-db"))
+            except Exception:
+                pass
+    
+    # Replay SCALE if prompt says service was scaled (L2_DB_SME is authorized)
+    if "scaled" in prompt_lower:
+        if "auth-api" in prompt_lower:
+            try:
+                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="auth-api", cpu_value=2048))
+            except Exception:
+                pass
+        if "payment-db" in prompt_lower:
+            try:
+                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="payment-db", cpu_value=4096))
+            except Exception:
+                pass
+
+
 def _detect_role_from_prompt(prompt_str: str) -> str:
     """Extract the agent role from the prompt string."""
     prompt_lower = prompt_str.lower()
@@ -385,7 +438,7 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
     for _ in range(num_episodes):
         env = CloudSREEnv()
         # Randomly pick a task
-        task = ["task1_status_audit", "task2_self_healing", "task3_latency_resolution"][torch.randint(0, 3, (1,)).item()]
+        task = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"][torch.randint(0, 3, (1,)).item()]
         obs = env.reset(task_id=task)
         
         # Simulate expert trajectory
@@ -406,7 +459,7 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         
         # Turn 3: L1 gets logs from problematic service
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
-        target_svc = "payment-db" if "task1" in task or "task2" in task else "auth-api"
+        target_svc = "payment-db" if "task2" in task else "auth-api"
         log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
         agent_histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
         

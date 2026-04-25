@@ -130,6 +130,9 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         step_obs, _, done, _ = env.step(action)
         
         if action.action_type == ActionType.MESSAGE_CHANNEL:
+            if action.target not in agent_histories:
+                agent_histories[current_agent] += f"\n[ERROR] Invalid target '{action.target}'. Valid targets: IC, L1_Triage, L2_DB_SME"
+                continue
             msg = f"\nNew message from {current_agent}: {action.message}"
             agent_histories[action.target] += msg
             current_agent = action.target 
@@ -154,7 +157,7 @@ def main():
     
     # 2. Run scenarios
     env = CloudSREEnv()
-    tasks = ["task1_status_audit", "task2_self_healing", "task3_latency_resolution"]
+    tasks = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"]
     
     results = {}
     for task in tasks:
