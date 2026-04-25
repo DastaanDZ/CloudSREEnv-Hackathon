@@ -614,9 +614,15 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load the model in 16-bit float to save VRAM on T4
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     MODEL_NAME,
+    #     torch_dtype=torch.float16
+    # ).to(DEVICE)
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16
+        torch_dtype=torch.bfloat16, 
+        attn_implementation="flash_attention_2" 
     ).to(DEVICE)
     
     # Build diverse training dataset
@@ -630,20 +636,36 @@ def main():
     )
 
     # --- GRPO Training Configuration ---
+    # training_args = GRPOConfig(
+    #     output_dir="./grpo_sre_model",
+    #     learning_rate=3e-5,           # Moderate LR for stable convergence
+    #     per_device_train_batch_size=1,
+    #     gradient_accumulation_steps=4,
+    #     num_generations=6,            # More generations for better variance
+    #     generation_batch_size=6, 
+    #     logging_steps=10,
+    #     max_steps=200,                # More steps for workflow learning
+    #     report_to="none",
+    #     fp16=True, 
+    #     gradient_checkpointing=True,
+    #     max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
+    #     temperature=0.9,              # Higher temp for more diverse exploration
+    # )
+
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
-        learning_rate=3e-5,           # Moderate LR for stable convergence
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_generations=6,            # More generations for better variance
-        generation_batch_size=6, 
+        learning_rate=4e-5,            # Train slightly faster
+        per_device_train_batch_size=2, # INCREASED: We have the VRAM for it now!
+        gradient_accumulation_steps=2, 
+        num_generations=4,             # Generates 4 thoughts per prompt
+        generation_batch_size=4, 
         logging_steps=10,
-        max_steps=200,                # More steps for workflow learning
+        max_steps=200,                 
         report_to="none",
-        fp16=True, 
-        gradient_checkpointing=True,
-        max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
-        temperature=0.9,              # Higher temp for more diverse exploration
+        bf16=True,                     # CHANGED: Use bfloat16 instead of fp16
+        gradient_checkpointing=False,  # CHANGED: Turned OFF for massive speed boost
+        max_completion_length=60,      # CRITICAL: Forces fast, short JSON generation
+        temperature=0.8,
     )
     
     trainer = GRPOTrainer(
