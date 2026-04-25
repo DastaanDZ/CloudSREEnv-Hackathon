@@ -140,15 +140,24 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             if current_agent == "L1_Triage":
                 agent_histories[current_agent] += "\n[SYSTEM] You have already gathered logs. Report your findings to IC using MESSAGE_CHANNEL."
             elif current_agent == "L2_DB_SME":
-                agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
+                last_l2_key = recent_actions[current_agent][-1]
+                if "RESTART" in last_l2_key or "SCALE" in last_l2_key:
+                    agent_histories[current_agent] += "\n[SYSTEM] Fix already applied successfully. Do NOT repeat it. Report completion to IC now: {\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
+                else:
+                    agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
             elif current_agent == "IC":
                 last_action_key = recent_actions[current_agent][-1]
+                has_l2_message = "new message from l2_db_sme" in agent_histories[current_agent].lower()
                 if "CLOSE_INCIDENT" in last_action_key:
                     agent_histories[current_agent] += "\n[SYSTEM] Incident cannot be closed yet. If L1 reported a fixable issue, delegate the fix to L2_DB_SME."
                 elif "MESSAGE_CHANNEL:L1_Triage" in last_action_key:
                     agent_histories[current_agent] += "\n[SYSTEM] You already delegated to L1. If L1 reported findings, delegate the fix to L2_DB_SME using MESSAGE_CHANNEL."
+                elif "MESSAGE_CHANNEL:L2_DB_SME" in last_action_key and has_l2_message:
+                    agent_histories[current_agent] += "\n[SYSTEM] L2 has already reported back. Close the incident now: {\"action_type\": \"CLOSE_INCIDENT\"}"
+                elif "MESSAGE_CHANNEL:L2_DB_SME" in last_action_key:
+                    agent_histories[current_agent] += "\n[SYSTEM] You already delegated to L2. Wait for L2's response or try CLOSE_INCIDENT if the fix was applied."
                 else:
-                    agent_histories[current_agent] += "\n[SYSTEM] Try a different action. If investigation is complete, delegate fix to L2_DB_SME or close the incident."
+                    agent_histories[current_agent] += "\n[SYSTEM] Try a different action. Delegate fix to L2_DB_SME or close the incident."
         
         step_obs, _, done, _ = env.step(action)
         
