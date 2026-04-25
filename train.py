@@ -144,7 +144,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
         is_after_investigation = any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
         is_after_fix = any(kw in prompt_lower for kw in ["l2_db_sme confirms", "l2_db_sme reports", "all services now healthy", "fix successfully", "restarted and is now", "scaled to"])
-        is_investigation_only = any(kw in prompt_lower for kw in ["tls", "certificate", "handshake", "no local fix", "no fix available"])
+        has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
+        is_investigation_only = has_cert_log_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
         
         # --- IC Workflow ---
         if role == "IC":
@@ -327,7 +328,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             env = CloudSREEnv()
             
             # Select scenario based on prompt context
-            if "tls" in prompt_lower or "certificate" in prompt_lower or "handshake" in prompt_lower:
+            if "login failure" in prompt_lower or "authentication error" in prompt_lower or "authentication flow" in prompt_lower or "certificate has expired" in prompt_lower:
                 env.reset(task_id="task1_tls_certificate_rca")
             elif "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
                 env.reset(task_id="task2_self_healing")
@@ -389,14 +390,14 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
         except Exception:
             pass
     
-    # Replay GET_LOGS if prompt contains log output (indicates prior GET_LOGS action)
-    if "=== logs:" in prompt_lower or "oomkilled" in prompt_lower or "error:" in prompt_lower or "tls" in prompt_lower or "certificate" in prompt_lower:
+    # Replay GET_LOGS if prompt contains actual log output (=== Logs: <svc> ===)
+    if "=== logs:" in prompt_lower or "oomkilled" in prompt_lower:
         if "payment-db" in prompt_lower:
             try:
                 env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
             except Exception:
                 pass
-        if "auth-api" in prompt_lower and ("cpu" in prompt_lower or "rps" in prompt_lower or "latency" in prompt_lower or "tls" in prompt_lower or "certificate" in prompt_lower or "handshake" in prompt_lower):
+        if "=== logs: auth-api ===" in prompt_lower:
             try:
                 env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
             except Exception:

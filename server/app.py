@@ -125,7 +125,7 @@ class MockCloud:
             "[ERROR] x509: certificate signed by unknown authority",
             "[WARN] Upstream certificate expired 2 days ago"
         ]
-        self.incident_channel.append("[SYSTEM ALERT] auth-api reporting TLS handshake failures.")
+        self.incident_channel.append("[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.")
 
     def _propagate_failures(self):
         deps = {

@@ -67,10 +67,10 @@ PROMPTS = {
 # The model must learn to handle accumulated multi-turn context.
 SCENARIO_MESSAGES = {
     "IC": [
-        # Task1: TLS Certificate Expiry (investigation only, no fix needed)
-        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api reporting TLS handshake failures.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api TLS errors detected. Users unable to login.",
-        "INITIAL ALERT:\n[SYSTEM ALERT] auth-api reporting TLS handshake failures.\nNew message from L1_Triage: Root cause found. auth-api has expired upstream certificate. No local fix available.",
+        # Task1: Login failures (symptom-only alert, root cause hidden in logs)
+        "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Increased authentication error rate detected for user login requests.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.\nNew message from L1_Triage: Root cause found. auth-api has expired upstream certificate. No local fix available.",
         
         # Task2: payment-db crash (needs RESTART)
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.",
@@ -85,7 +85,7 @@ SCENARIO_MESSAGES = {
     "L1_Triage": [
         # Initial investigation prompts
         "New message from IC: Investigate the cluster status. Find what's causing the alert.",
-        "New message from IC: Users reporting TLS errors. Check auth-api.",
+        "New message from IC: Users reporting login failures. Investigate the authentication flow.",
         "New message from IC: Users reporting errors. Investigate and report back.",
         
         # After LIST_SERVICES - should GET_LOGS on suspicious service
@@ -94,7 +94,7 @@ SCENARIO_MESSAGES = {
         
         # Task1: TLS Certificate logs - should MESSAGE_CHANNEL to IC (no fix needed)
         "New message from IC: Check auth-api.\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[ERROR] x509: certificate signed by unknown authority",
-        "New message from IC: Investigate TLS issues.\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[WARN] Upstream certificate expired 2 days ago",
+        "New message from IC: Check auth-api logs.\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[WARN] Upstream certificate expired 2 days ago",
         
         # Task2: payment-db crash logs
         "New message from IC: Check payment-db.\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff",
