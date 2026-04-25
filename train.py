@@ -59,7 +59,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         rewards.append(float(reward_obj.value))
         
         # Log for visibility
-        action_name = action.action_type.value if action.action_type else "INVALID"
+        action_name = action.action_type if action.action_type else "INVALID"
         logger.info(f"Action: {action_name:<15} | Reward: {reward_obj.value:+.2f} | Reason: {reward_obj.reason}")
 
     return rewards
@@ -106,12 +106,11 @@ def main():
         learning_rate=2e-5,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=2,
-        num_generations=4, # <--- The GRPO magic: Generates 4 answers, compares them, keeps the best!
-        max_prompt_length=512,
-        max_completion_length=150,
+        num_generations=4, 
+        generation_batch_size=4, # <--- NEW: Explicitly tells TRL to batch our 4 generations together
         logging_steps=1,
-        max_steps=50, # Keep small for local testing
-        report_to="none" # Disable wandb for local runs
+        max_steps=50, 
+        report_to="none" 
     )
     
     trainer = GRPOTrainer(
