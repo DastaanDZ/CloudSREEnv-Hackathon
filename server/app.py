@@ -1,16 +1,17 @@
 """
-CloudSREEnv v2.2 — Enhanced with Cascading Failures and (0, 1) Non-Binary Graders.
+CloudSREEnv v4.0 — RL Training Edition (Dense Rewards & Composable Rubrics)
 """
 
 from __future__ import annotations
 
-import random
-import time
+import logging
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
+# --- Setup Logging ---
+logger = logging.getLogger("CloudEnv")
 
 # ---------------------------------------------------------------------------
 # Typed Models (OpenEnv Spec)
@@ -21,17 +22,19 @@ class ActionType(str, Enum):
     GET_LOGS = "GET_LOGS"
     RESTART = "RESTART"
     SCALE = "SCALE"
-
+    MESSAGE_CHANNEL = "MESSAGE_CHANNEL"
+    CLOSE_INCIDENT = "CLOSE_INCIDENT"
+    INVALID_FORMAT = "INVALID_FORMAT" # NEW: For RL Syntax Penalties
 
 class Action(BaseModel):
-    """Typed action model consumed by env.step()."""
     action_type: ActionType
+    agent_id: str = "SYSTEM"
     service_id: Optional[str] = None
     cpu_value: Optional[int] = None
+    target: Optional[str] = None
+    message: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
-
+    model_config = ConfigDict(use_enum_values=True)
 
 class ServiceMetrics(BaseModel):
     id: str
@@ -40,97 +43,68 @@ class ServiceMetrics(BaseModel):
     memory_allocated: int
     latency_ms: int
 
-
 class Observation(BaseModel):
-    """Returned after every env.step()."""
     text_output: str
     structured_data: List[ServiceMetrics] = Field(default_factory=list)
-
 
 class Reward(BaseModel):
     value: float = Field(ge=-1.0, le=1.0)
     reason: str = ""
-
+    breakdown: Dict[str, float] = Field(default_factory=dict) # NEW: For OpenEnv Rubrics
 
 # ---------------------------------------------------------------------------
 # Service & MockCloud
 # ---------------------------------------------------------------------------
 
 class Service:
-    def __init__(
-        self,
-        id: str,
-        status: str = "Running",
-        cpu_allocated: int = 512,
-        memory_allocated: int = 1024,
-        latency_ms: int = 30,
-        logs: Optional[List[str]] = None,
-        error_message: str = "",
-    ):
+    def __init__(self, id: str, status: str = "Running", cpu: int = 1024, mem: int = 2048, lat: int = 45):
         self.id = id
         self.status = status
-        self.cpu_allocated = cpu_allocated
-        self.memory_allocated = memory_allocated
-        self.latency_ms = latency_ms
-        self.logs: List[str] = logs or []
-        self.error_message = error_message
+        self.cpu_allocated = cpu
+        self.memory_allocated = mem
+        self.latency_ms = lat
+        self.logs: List[str] = []
+        self.error_message: str = ""
 
-    def to_metrics(self) -> ServiceMetrics:
+    @property
+    def metrics(self) -> ServiceMetrics:
         return ServiceMetrics(
-            id=self.id,
-            status=self.status,
-            cpu_allocated=self.cpu_allocated,
-            memory_allocated=self.memory_allocated,
-            latency_ms=self.latency_ms,
+            id=self.id, status=self.status, cpu_allocated=self.cpu_allocated,
+            memory_allocated=self.memory_allocated, latency_ms=self.latency_ms
         )
 
-
 class MockCloud:
-    """Internal state machine simulating a Kubernetes cluster."""
-
-    RPS_NORMAL = 200
+    RPS_NORMAL = 500
     RPS_HIGH = 3500
 
     def __init__(self):
         self.services: Dict[str, Service] = {}
-        self.rps: int = self.RPS_NORMAL
-        self.scenario: str = "healthy"
-        self._build_default_services()
+        self.rps = self.RPS_NORMAL
+        self.incident_channel: List[str] = []
 
-    def _propagate_failures(self):
-        """Cascading Failure Logic: Propagates health and latency issues."""
-        baselines = {"auth-api": 28, "payment-db": 12, "inventory-svc": 45, "notification-worker": 60}
-        for svc_id, svc in self.services.items():
-            svc.error_message = ""
-            if svc.status == "Running":
-                svc.latency_ms = baselines.get(svc_id, 30)
-
-        deps = {"auth-api": "payment-db", "inventory-svc": "payment-db", "notification-worker": "inventory-svc"}
-
-        for dependent, provider_id in deps.items():
-            provider = self.services[provider_id]
-            dep_svc = self.services[dependent]
-
-            if provider.status == "Error":
-                dep_svc.error_message = f"Critical: 503 Service Unavailable - Upstream {provider_id} is down."
-            elif provider.latency_ms > 200:
-                dep_svc.latency_ms += int(provider.latency_ms * 0.5)
-                dep_svc.error_message = f"Warning: Upstream {provider_id} is slow."
-
-    def _build_default_services(self):
+    def reset(self, scenario: str = "healthy"):
         self.services = {
-            "auth-api": Service("auth-api", status="Running", cpu_allocated=512, memory_allocated=2048, latency_ms=28),
-            "payment-db": Service("payment-db", status="Running", cpu_allocated=1024, memory_allocated=4096, latency_ms=12),
-            "inventory-svc": Service("inventory-svc", status="Running", cpu_allocated=256, memory_allocated=512, latency_ms=45),
-            "notification-worker": Service("notification-worker", status="Running", cpu_allocated=128, memory_allocated=256, latency_ms=60),
+            "auth-api": Service("auth-api"),
+            "payment-db": Service("payment-db", cpu=2048, mem=4096, lat=12),
+            "inventory-svc": Service("inventory-svc"),
+            "notification-worker": Service("notification-worker", lat=60),
         }
         self.rps = self.RPS_NORMAL
+        self.incident_channel = []
+
+        if scenario == "crash_loop":
+            self._apply_crash_loop()
+        elif scenario == "performance_bottleneck":
+            self._apply_performance_bottleneck()
+
+        self._propagate_failures()
 
     def _apply_crash_loop(self):
         svc = self.services["payment-db"]
         svc.status = "Error"
         svc.latency_ms = 0
         svc.logs = ["[ERROR] OOMKilled", "[ERROR] CrashLoopBackOff"]
+        self.incident_channel.append("[SYSTEM ALERT] payment-db status transition to Error detected.")
 
     def _apply_performance_bottleneck(self):
         self.rps = self.RPS_HIGH
@@ -138,224 +112,225 @@ class MockCloud:
         svc.cpu_allocated = 128
         svc.latency_ms = 850
         svc.logs = [f"[WARN] RPS={self.rps} — CPU usage 99.8%"]
-        self._propagate_failures()
+        self.incident_channel.append("[SYSTEM ALERT] High latency (850ms) detected on auth-api.")
 
-    def reset(self, scenario: Optional[str] = None) -> str:
-        self._build_default_services()
-        self.scenario = scenario or random.choice(SCENARIOS)
-        if self.scenario == "crash_loop": self._apply_crash_loop()
-        elif self.scenario == "performance_bottleneck": self._apply_performance_bottleneck()
-        self._propagate_failures()
-        return self.scenario
+    def _propagate_failures(self):
+        deps = {
+            "auth-api": "payment-db",
+            "inventory-svc": "payment-db",
+            "notification-worker": "inventory-svc"
+        }
+        for svc in self.services.values():
+            svc.error_message = ""
+            if svc.status == "Running" and svc.id != "auth-api":
+                svc.latency_ms = 45 if svc.id != "payment-db" else 12
 
-    def get_all_metrics(self) -> List[ServiceMetrics]:
-        return [s.to_metrics() for s in self.services.values()]
+        for dependent, provider_id in deps.items():
+            provider = self.services.get(provider_id)
+            dep_svc = self.services.get(dependent)
+            if not provider or not dep_svc: continue
 
-    def service_ids(self) -> List[str]:
-        return list(self.services.keys())
-
-
-# ---------------------------------------------------------------------------
-# CloudSREEnv (OpenEnv Interface)
-# ---------------------------------------------------------------------------
+            if provider.status == "Error":
+                dep_svc.error_message = f"Critical: 503 Service Unavailable - Upstream {provider_id} is down."
+            elif provider.latency_ms > 200:
+                dep_svc.latency_ms += int(provider.latency_ms * 0.5)
+                dep_svc.error_message = f"Warning: Upstream {provider_id} is slow."
 
 class CloudSREEnv:
     def __init__(self):
         self.cloud = MockCloud()
-        self.current_task: Optional[str] = None
-        self.step_count: int = 0
-        self.done: bool = False
-        self.cumulative_reward: float = 0.0
+        self.current_task = ""
         self.action_history: List[Action] = []
-        self._error_detected: bool = False
-        self._scenario: str = "healthy"
+        self.done = False
+        self.steps_taken = 0
+        self.max_steps = 15 # RL needs a strict cutoff
 
     def reset(self, task_id: Optional[str] = None, scenario: Optional[str] = None) -> Observation:
         self.current_task = task_id or "task1_status_audit"
-        self.step_count = 0
+        self.action_history.clear()
         self.done = False
-        self.cumulative_reward = 0.0
-        self.action_history = []
-        self._error_detected = False
+        self.steps_taken = 0
 
-        if scenario is None:
-            task_scenario_map = {
-                "task1_status_audit": "crash_loop",
-                "task2_self_healing": "crash_loop",
-                "task3_latency_resolution": "performance_bottleneck",
-            }
-            scenario = task_scenario_map.get(self.current_task, "healthy")
+        if "task1" in self.current_task or "task2" in self.current_task:
+            self.cloud.reset(scenario="crash_loop")
+        elif "task3" in self.current_task:
+            self.cloud.reset(scenario="performance_bottleneck")
+        else:
+            self.cloud.reset(scenario=scenario or "healthy")
 
-        self._scenario = self.cloud.reset(scenario=scenario)
-        obs_text = f"=== CloudSREEnv Initialized ===\nTask: {self.current_task}\nScenario: {self._scenario}\n"
-        return Observation(text_output=obs_text, structured_data=self.cloud.get_all_metrics())
+        return Observation(text_output="\n".join(self.cloud.incident_channel))
 
-    def step(self, action: Action) -> tuple[Observation, Reward, bool, Dict[str, Any]]:
-        if self.done:
-            return Observation(text_output="Episode finished."), Reward(value=0.0), True, {}
+    def step(self, action: Action) -> tuple[Observation, Reward, bool, dict]:
+        self.steps_taken += 1
+        
+        if self.done or self.steps_taken > self.max_steps:
+            return Observation(text_output="Episode Terminated."), Reward(value=0.0, reason="Max steps reached or already done."), True, {}
 
-        self.step_count += 1
         self.action_history.append(action)
-        reward_val, obs_text, error_msg = 0.0, "", None
+        obs_text = ""
+        
+        # --- NEW: OPENENV COMPOSABLE RUBRIC EVALUATION ---
+        total_reward, breakdown, reason = self._calculate_rubric(action)
 
-        # Validation
-        service_id = action.service_id
-        service_exists = service_id in self.cloud.services if service_id else True
+        # If it was an invalid format, immediately return the penalty (Don't execute)
+        if action.action_type == ActionType.INVALID_FORMAT:
+            return Observation(text_output="[SYSTEM] INVALID JSON FORMAT."), Reward(value=total_reward, reason=reason, breakdown=breakdown), False, {}
 
-        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART, ActionType.SCALE):
-            if not service_id:
-                obs_text, reward_val, error_msg = "[ERROR] Missing service_id.", -0.2, "Missing service_id"
-            elif not service_exists:
-                obs_text, reward_val, error_msg = f"[ERROR] Service '{service_id}' not found.", -0.2, "hallucinated_service"
+        # If it was an RBAC violation, immediately return the penalty (Don't execute)
+        if "rbac_penalty" in breakdown:
+            obs_text = f"[403 Forbidden] Agent {action.agent_id} lacks permissions to modify cluster resources."
+            return Observation(text_output=obs_text), Reward(value=total_reward, reason=reason, breakdown=breakdown), False, {}
 
-        # Execution
-        if error_msg is None:
-            if action.action_type == ActionType.LIST_SERVICES:
-                if len(self.action_history) > 1 and self.action_history[-2].action_type == ActionType.LIST_SERVICES:
-                    reward_val, obs_text = -0.1, "Cluster state hasn't changed."
-                else:
-                    lines = [f"{svc.id:<20} {svc.status:<10} {svc.latency_ms}" for svc in self.cloud.services.values()]
-                    obs_text = "\n".join(lines)
-                    reward_val = 0.1
-                    for svc in self.cloud.services.values():
-                        if svc.status == "Error": self._error_detected = True
+        # --- EXECUTE ACTIONS ---
+        if action.action_type == ActionType.LIST_SERVICES:
+            lines = [f"{svc.id:<20} {svc.status:<10} {svc.latency_ms}ms" for svc in self.cloud.services.values()]
+            obs_text = "\n".join(lines)
 
-            elif action.action_type == ActionType.GET_LOGS:
-                svc = self.cloud.services[service_id]
-                obs_text = f"=== Logs: {service_id} ===\n" + (f"[ERROR] {svc.error_message}" if svc.error_message else "\n".join(svc.logs))
-                reward_val = 0.1
+        elif action.action_type == ActionType.GET_LOGS:
+            svc = self.cloud.services.get(action.service_id)
+            if not svc:
+                obs_text = f"[ERROR] Service {action.service_id} not found."
+                total_reward -= 0.1 # Small penalty for hallucinating a service name
+            else:
+                logs = list(svc.logs)
+                if svc.error_message: logs.append(svc.error_message)
+                obs_text = f"=== Logs: {action.service_id} ===\n" + "\n".join(logs) if logs else "No logs."
 
-            elif action.action_type == ActionType.RESTART:
-                svc = self.cloud.services[service_id]
-                if svc.status == "Running":
-                    obs_text, reward_val = f"[WARN] {service_id} is already Running.", -0.5
-                else:
-                    svc.status = "Running"
+        elif action.action_type == ActionType.RESTART:
+            svc = self.cloud.services.get(action.service_id)
+            if svc and svc.status == "Running":
+                obs_text = f"[WARN] {action.service_id} is already Running."
+                total_reward -= 0.2 # Penalty for restarting a healthy service
+            elif svc:
+                svc.status = "Running"
+                self.cloud._propagate_failures()
+                obs_text = f"[OK] {action.service_id} restarted by {action.agent_id}."
+
+        elif action.action_type == ActionType.SCALE:
+            svc = self.cloud.services.get(action.service_id)
+            if svc:
+                svc.cpu_allocated = action.cpu_value
+                if action.cpu_value >= 2048:
+                    svc.latency_ms = 45 if svc.id != "payment-db" else 12
+                    svc.logs = ["[INFO] Scaled successfully."]
                     self.cloud._propagate_failures()
-                    obs_text, reward_val = f"[OK] {service_id} restarted.", 0.0
+                obs_text = f"[OK] {action.service_id} scaled to {action.cpu_value}m CPU."
 
-            elif action.action_type == ActionType.SCALE:
-                if not action.cpu_value or action.cpu_value <= 0:
-                    obs_text, reward_val = "[ERROR] Invalid cpu_value.", -0.2
-                else:
-                    svc = self.cloud.services[service_id]
-                    svc.cpu_allocated = action.cpu_value
-                    if action.cpu_value >= 2048: svc.latency_ms = 45
-                    self.cloud._propagate_failures()
-                    obs_text, reward_val = f"[OK] {service_id} scaled to {action.cpu_value}m.", 0.0
+        elif action.action_type == ActionType.MESSAGE_CHANNEL:
+            msg = f"[{action.agent_id} -> {action.target}]: {action.message}"
+            self.cloud.incident_channel.append(msg)
+            obs_text = "[OK] Message posted to Incident Channel."
 
-        # ---- Grader Fix: Strictly (0, 1) ----
-        task_done, task_score = self._grade()
-        if task_done:
-            reward_val += task_score
-            self.done = True
+        elif action.action_type == ActionType.CLOSE_INCIDENT:
+            task_done, final_score = self._grade_terminal_state()
+            if task_done:
+                self.done = True
+                total_reward += final_score
+                breakdown["task_completion"] = final_score
+                return Observation(text_output="[INCIDENT CLOSED] Task completed successfully."), Reward(value=total_reward, reason="Task Success", breakdown=breakdown), True, {}
+            else:
+                total_reward -= 0.5
+                breakdown["false_closure_penalty"] = -0.5
+                return Observation(text_output="[ERROR] Cannot close incident. Criteria not met."), Reward(value=total_reward, reason="Premature Closure", breakdown=breakdown), False, {}
 
-        reward = Reward(value=max(-1.0, min(1.0, reward_val)), reason="step_evaluation")
-        self.cumulative_reward += reward.value
+        # Cap the reward between -1.0 and 1.0 to comply with OpenEnv Spec
+        capped_reward = max(-1.0, min(1.0, total_reward))
+        
+        return Observation(text_output=obs_text), Reward(value=capped_reward, reason=reason, breakdown=breakdown), self.done, {}
 
-        info = {
-            "step": self.step_count,
-            "scenario": self._scenario,
-            "task": self.current_task,
-            "error": error_msg,
-            "score": task_score # Ensure score is passed for inference.py
-        }
-        return Observation(text_output=obs_text, structured_data=self.cloud.get_all_metrics()), reward, self.done, info
+    # --- DENSE REWARD RUBRIC ---
+    def _calculate_rubric(self, action: Action) -> tuple[float, dict, str]:
+        """Calculates dense rewards for RL training."""
+        reward = 0.0
+        breakdown = {}
+        reason = "Step execution."
 
-    def state(self) -> Dict[str, Any]:
-        return {"task": self.current_task, "done": self.done, "cumulative_reward": round(self.cumulative_reward, 4), "services": [s.to_metrics().dict() for s in self.cloud.services.values()]}
+        # 1. Syntax Rubric (Punish hallucinations heavily)
+        if action.action_type == ActionType.INVALID_FORMAT:
+            return -0.5, {"syntax_penalty": -0.5}, "Invalid JSON format."
 
-    # ------------------------------------------------------------------
-    # Graders (Deterministic — No LLMs)
-    # ------------------------------------------------------------------
+        # 2. Tool-Use Rubric (Reward discovery and communication)
+        if action.action_type in [ActionType.LIST_SERVICES, ActionType.GET_LOGS]:
+            reward += 0.05
+            breakdown["tool_discovery"] = 0.05
+            reason = "Gathered information."
+            
+        elif action.action_type == ActionType.MESSAGE_CHANNEL:
+            reward += 0.1
+            breakdown["collaboration"] = 0.1
+            reason = "Communicated in channel."
 
-    def _grade(self) -> tuple[bool, float]:
-        """Returns (done, score). Success scores are strictly (0, 1)."""
-        if self.current_task == "task1_status_audit":
-            return self._grade_task1()
-        elif self.current_task == "task2_self_healing":
-            return self._grade_task2()
-        elif self.current_task == "task3_latency_resolution":
-            return self._grade_task3()
-        return False, 0.01
+        # 3. RBAC Rubric (Strictly enforce roles)
+        if action.action_type in [ActionType.RESTART, ActionType.SCALE]:
+            if action.agent_id != "L2_DB_SME":
+                return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
+            else:
+                reward += 0.2
+                breakdown["authorized_action"] = 0.2
+                reason = "Executed authorized modification."
 
-    def _grade_task1(self) -> tuple[bool, float]:
-        """Success: 0.90"""
-        if self.action_history and self.action_history[-1].action_type == ActionType.GET_LOGS:
-            if self.action_history[-1].service_id == "payment-db":
-                return True, 0.90
-        return False, 0.01
+        # 4. Time Penalty (Encourages efficiency)
+        time_penalty = -0.02 * self.steps_taken
+        reward += time_penalty
+        breakdown["time_penalty"] = time_penalty
 
-    def _grade_task2(self) -> tuple[bool, float]:
-        """Success: 0.95"""
-        if self._error_detected and self.cloud.services["payment-db"].status == "Running":
-            return True, 0.95
-        return False, 0.01
+        return reward, breakdown, reason
 
-    def _grade_task3(self) -> tuple[bool, float]:
-        """Success: 0.99"""
-        svc = self.cloud.services.get("auth-api")
-        if svc and svc.cpu_allocated >= 2048 and svc.latency_ms < 100:
-            return True, 0.99
-        return False, 0.01
-
+    # --- TERMINAL GRADER (Task Success) ---
+    def _grade_terminal_state(self) -> tuple[bool, float]:
+        """Evaluates if the final state matches the scenario objective."""
+        if "task1" in self.current_task:
+            found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "payment-db" for a in self.action_history)
+            return (True, 0.8) if found_logs else (False, 0.0)
+            
+        elif "task2" in self.current_task:
+            return (True, 0.9) if self.cloud.services["payment-db"].status == "Running" else (False, 0.0)
+            
+        elif "task3" in self.current_task:
+            svc = self.cloud.services["auth-api"]
+            return (True, 1.0) if svc.cpu_allocated >= 2048 and svc.latency_ms < 100 else (False, 0.0)
+            
+        return False, 0.0
 
 # ---------------------------------------------------------------------------
-# HTTP Shim
+# FastAPI Server Setup
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# OpenEnv HTTP shim (serves /step, /reset, /state on port 8000)
-# ---------------------------------------------------------------------------
-
 def create_app():
-    """Returns the FastAPI app and uvicorn module."""
     try:
         from fastapi import FastAPI
         from fastapi.responses import JSONResponse
         import uvicorn
 
-        app = FastAPI(title="CloudSREEnv", version="1.0.0")
+        app = FastAPI(title="CloudSREEnv", version="4.0.0-RL")
         env = CloudSREEnv()
 
         @app.post("/reset")
         def api_reset(task_id: Optional[str] = None, scenario: Optional[str] = None):
             obs = env.reset(task_id=task_id, scenario=scenario)
-            return JSONResponse(obs.dict())
+            return JSONResponse(obs.model_dump())
 
         @app.post("/step")
         def api_step(action: Action):
             obs, reward, done, info = env.step(action)
             return JSONResponse({
-                "observation": obs.dict(),
-                "reward": reward.dict(),
-                "done": done,
-                "info": info,
+                "observation": obs.model_dump(), 
+                "reward": reward.model_dump(), 
+                "done": done, 
+                "info": info
             })
-
-        @app.get("/state")
-        def api_state():
-            return JSONResponse(env.state())
-
-        @app.get("/health")
-        def health():
-            return {"status": "ok", "env": "CloudSREEnv"}
-
+        
         return app, uvicorn
-
-    except ImportError:
+    except ImportError as e:
+        logger.error(f"Failed to start API: {e}")
         return None, None
 
-# IMPORTANT: This function must be at the top level (no indentation)
 def main():
-    """The entry point for the 'server' command."""
-    import uvicorn
-    app_instance, _ = create_app()
-    if app_instance:
-        # Use host 0.0.0.0 for Docker/Cloud compatibility
-        uvicorn.run(app_instance, host="0.0.0.0", port=8000)
+    app_instance, uvicorn_module = create_app()
+    if app_instance and uvicorn_module:
+        logger.info("Starting CloudSREEnv RL Training API Server on http://0.0.0.0:8000")
+        uvicorn_module.run(app_instance, host="0.0.0.0", port=8000)
     else:
-        print("[ERROR] FastAPI or Uvicorn not installed. Cannot start server.")
+        print("Could not start the server.")
 
 if __name__ == "__main__":
     main()

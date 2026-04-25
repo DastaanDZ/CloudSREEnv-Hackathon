@@ -1,20 +1,29 @@
 """
-inference.py — Baseline SRE agent for CloudSREEnv.
-Updated for Phase 2 (0, 1) score compliance and mandatory stdout formatting.
+inference.py — Multi-Agent Incident Orchestrator with Detailed Logging
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
-import time
-from typing import Any, Dict, List, Optional
+import re
+import logging
+from typing import Dict, List
 
 from openai import OpenAI
-
-# Ensure this import matches your directory structure (e.g., 'from app import ...')
 from server.app import Action, ActionType, CloudSREEnv
+
+# --- Setup Logging ---
+# Change level to logging.INFO if you want to hide the deep debugging noise
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("Orchestrator")
+# Silence external noisy loggers
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -22,146 +31,161 @@ from server.app import Action, ActionType, CloudSREEnv
 
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
-
-MAX_STEPS_PER_TASK = 18
-TASKS = [
-    "task1_status_audit",
-    "task2_self_healing",
-    "task3_latency_resolution",
-]
 
 # ---------------------------------------------------------------------------
-# System prompt
+# Multi-Agent Prompts
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) operating inside a Kubernetes-style cloud environment called CloudSREEnv. 
+IC_PROMPT = """You are the Incident Commander (IC). You orchestrate the response.
+Read the alerts and messages from the channel.
+- If the Current Task is an "audit" or "triage" (e.g., task1), your goal is ONLY to find the root cause. Once L1_Triage reports the logs, CLOSE the incident.
+- If the Current Task involves "recovery" or "resolution" (e.g., task2, task3), you MUST explicitly tell L2_DB_SME the exact service_id (e.g., "payment-db") to fix.
+- Once L2_DB_SME reports the fix is successfully applied, DO NOT message them again. IMMEDIATELY use CLOSE_INCIDENT.
 
-You have access to these actions (respond with ONLY valid JSON):
-  {"action_type": "LIST_SERVICES"}
-  {"action_type": "GET_LOGS",  "service_id": "<id>"}
-  {"action_type": "RESTART",   "service_id": "<id>"}
-  {"action_type": "SCALE",     "service_id": "<id>", "cpu_value": <int>}
+Tools:
+{"action_type": "MESSAGE_CHANNEL", "target": "<L1_Triage or L2_DB_SME>", "message": "<explicit instructions>"}
+{"action_type": "CLOSE_INCIDENT"}
 
-Rules:
-- Always start with LIST_SERVICES to assess cluster health.
-- PERFORM ROOT CAUSE ANALYSIS (RCA): If a service has high latency (>200ms) or returns errors, run GET_LOGS on it immediately.
-- TRACE UPSTREAM: If logs mention an 'Upstream' error or provider slowness, pivot immediately to investigate that provider service.
-- TO FIX BOTTLENECKS: Use SCALE with cpu_value >= 2048 only on the service identified as the root cause (the one reporting CPU throttling or OOM).
-- IF A SERVICE STATUS IS 'Error':
-    1. Run GET_LOGS to confirm the reason.
-    2. Run RESTART to bring the service back online.
-- SEQUENTIAL FIXING: If a service is both crashed AND needs scaling, SCALE first, then RESTART.
-- Never restart a service that is already Running.
-- Never repeat LIST_SERVICES more than twice in a row; take a corrective action instead.
-- Respond ONLY with a single JSON object — no prose, no markdown fences.
-
-Valid service IDs: auth-api, payment-db, inventory-svc, notification-worker
+CRITICAL: Output EXACTLY ONE valid JSON object. No markdown, no explanations, no conversational text.
 """
 
-def build_client() -> OpenAI:
-    return OpenAI(
-        base_url=API_BASE_URL,
-        api_key=HF_TOKEN or "dummy-key",
-    )
+L1_PROMPT = """You are the L1 Triage Agent. You monitor cluster health.
+You CANNOT restart or scale services. You can only investigate.
+1. Run LIST_SERVICES to find slow or broken pods.
+2. Run GET_LOGS on suspicious pods to find the root cause.
+3. If the root cause is upstream (e.g., payment-db), use MESSAGE_CHANNEL to escalate to the IC.
 
-def parse_action(raw: str) -> Optional[Action]:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.split("\n")
-        raw = "\n".join(l for l in lines if not l.strip().startswith("```")).strip()
-    try:
-        data: Dict[str, Any] = json.loads(raw)
-        return Action(**data)
-    except Exception:
-        import re
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-                return Action(**data)
-            except Exception: pass
-    return None
+Tools:
+{"action_type": "LIST_SERVICES"}
+{"action_type": "GET_LOGS", "service_id": "<id>"}
+{"action_type": "MESSAGE_CHANNEL", "target": "IC", "message": "<your findings>"}
 
-def run_task(client: OpenAI, env: CloudSREEnv, task_id: str) -> tuple[bool, int, List[float]]:
+CRITICAL: Output EXACTLY ONE valid JSON object. No markdown, no explanations, no conversational text.
+"""
+
+L2_PROMPT = """You are the L2 Database SME.
+You only wake up when paged by the IC. You are authorized to use RESTART and SCALE.
+- If the IC tells you a database is crashing, use RESTART on that specific service_id.
+- If CPU is throttling (e.g., 99.8% CPU usage), use SCALE and set cpu_value to 2048.
+- IMPORTANT: Once you execute RESTART or SCALE and receive an "[OK]" response, you are DONE. Immediately use MESSAGE_CHANNEL to tell the IC the fix is applied. Do NOT run any more commands.
+
+Tools:
+{"action_type": "GET_LOGS", "service_id": "<actual_id>"}
+{"action_type": "RESTART", "service_id": "<actual_id>"}
+{"action_type": "SCALE", "service_id": "<actual_id>", "cpu_value": <int>}
+{"action_type": "MESSAGE_CHANNEL", "target": "IC", "message": "<fix applied>"}
+
+CRITICAL: Output EXACTLY ONE valid JSON object. No markdown, no explanations. NEVER use the literal string "<id>", replace it with the actual service name provided by the IC.
+"""
+
+PROMPTS = {
+    "IC": IC_PROMPT,
+    "L1_Triage": L1_PROMPT,
+    "L2_DB_SME": L2_PROMPT
+}
+
+# ---------------------------------------------------------------------------
+# Agent Orchestration Loop
+# ---------------------------------------------------------------------------
+
+def run_multi_agent_task(client: OpenAI, env: CloudSREEnv, task_id: str):
+    logger.info(f"========== STARTING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": obs.text_output},
-    ]
+    
+    agent_memory: Dict[str, List[Dict[str, str]]] = {
+        agent: [{"role": "system", "content": prompt}] for agent, prompt in PROMPTS.items()
+    }
 
-    # [START] Mandatory line
-    print(f"[START] task={task_id} env=CloudSRE model={MODEL_NAME}", flush=True)
+    current_agent = "IC"
+    task_context = f"Current Task: {task_id}\n\nINITIAL ALERT:\n{obs.text_output}"
+    agent_memory["IC"].append({"role": "user", "content": task_context})
 
-    reward_history: List[float] = []
+    reward_history = []
     success = False
-    final_task_score = 0.01  # Baseline non-zero score
+    max_steps = 20
 
-    for step_n in range(1, MAX_STEPS_PER_TASK + 1):
+    for step_n in range(1, max_steps + 1):
+        logger.info(f"--- Turn {step_n}: {current_agent} is Thinking ---")
+        
+        # --- Deep Log: What the agent is seeing right now ---
+        last_context = agent_memory[current_agent][-1]['content']
+        logger.debug(f"[{current_agent} INPUT CONTEXT] \n{last_context}")
+        
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=agent_memory[current_agent],
+            # temperature=0.0
+        )
+        
+        raw_reply = response.choices[0].message.content.strip()
+        
+        # --- Deep Log: What the LLM literally generated ---
+        logger.debug(f"[{current_agent} RAW LLM OUTPUT] \n{raw_reply}")
+
+        json_match = re.search(r'\{.*\}', raw_reply, re.DOTALL)
+        if json_match:
+            clean_json_str = json_match.group(0)
+        else:
+            clean_json_str = raw_reply
+
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.0 # Switched to 0.0 for reproducibility
-            )
-            raw_reply = response.choices[0].message.content or ""
-        except Exception as exc:
-            print(f"[STEP] step={step_n} action=ERROR reward=0.00 done=false error=API_CALL_FAILED", flush=True)
-            break
-
-        action = parse_action(raw_reply)
-        if action is None:
-            action_str, reward_val, done, error_msg = "PARSE_ERROR", -0.2, False, "parse_error"
-            print(f"[STEP] step={step_n} action={action_str} reward={reward_val:.2f} done={str(done).lower()} error={error_msg}", flush=True)
-            reward_history.append(reward_val)
-            messages.append({"role": "assistant", "content": raw_reply})
-            messages.append({"role": "user", "content": "[ERROR] Invalid JSON action."})
+            action_dict = json.loads(clean_json_str)
+            action_dict["agent_id"] = current_agent 
+            action = Action(**action_dict)
+        except Exception as e:
+            logger.error(f"[{current_agent} PARSE ERROR] Invalid JSON format. Exception: {e}")
+            agent_memory[current_agent].append({"role": "user", "content": "Format Error: Output must be ONLY valid JSON."})
             continue
 
-        step_obs, reward, done, info = env.step(action)
-        
-        # Update scores from environment info
-        final_task_score = info.get("score", 0.01)
-        error_msg = info.get("error") or "null"
-        if error_msg == "none": error_msg = "null"
-
-        action_str = action.action_type
+        action_str = f"{action.action_type}"
         if action.service_id: action_str += f"({action.service_id})"
+        if action.target: action_str += f" -> {action.target}"
+        logger.info(f"[{current_agent} ACTION EXECUTION] {action_str}")
 
-        # [STEP] Mandatory line (lowercase booleans)
-        print(f"[STEP] step={step_n} action={action_str} reward={reward.value:.2f} done={str(done).lower()} error={error_msg}", flush=True)
+        agent_memory[current_agent].append({"role": "assistant", "content": raw_reply})
+
+        # Execute Action in Environment
+        step_obs, reward, done, info = env.step(action)
         reward_history.append(reward.value)
+        
+        logger.debug(f"[ENVIRONMENT RESPONSE] \n{step_obs.text_output}")
 
-        messages.append({"role": "assistant", "content": raw_reply})
-        messages.append({"role": "user", "content": step_obs.text_output})
+        # --- ROUTING LOGIC ---
+        if action.action_type == ActionType.MESSAGE_CHANNEL:
+            target_agent = action.target
+            handoff_msg = f"New message in channel from {current_agent}: {action.message}"
+            agent_memory[target_agent].append({"role": "user", "content": handoff_msg})
+            
+            logger.info(f"[ROUTER] Passing context from {current_agent} to {target_agent}")
+            current_agent = target_agent
+        
+        elif action.action_type == ActionType.CLOSE_INCIDENT:
+            if done:
+                logger.info(f"[SYSTEM] Incident Closed Successfully by IC.")
+                success = True
+                break
+            else:
+                agent_memory[current_agent].append({"role": "user", "content": step_obs.text_output})
+        
+        else:
+            agent_memory[current_agent].append({"role": "user", "content": step_obs.text_output})
 
-        if done:
-            success = True
-            break
-
-    # [END] Mandatory line: Score MUST be strictly (0, 1)
-    success_str = str(success).lower()
-    reward_str = ",".join(f"{r:.2f}" for r in reward_history)
-    
-    # Ensure score is never exactly 0.0 or 1.0 for the validator
-    clamped_score = max(0.01, min(0.99, final_task_score))
-    
-    print(f"[END] success={success_str} steps={len(reward_history)} score={clamped_score:.2f} rewards={reward_str}", flush=True)
-    print("", flush=True)
-
-    return success, len(reward_history), reward_history
+    score = sum(reward_history) if success else 0.01
+    score = max(0.01, min(0.99, score))
+    logger.info(f"========== SCENARIO END: success={success} | steps={len(reward_history)} | score={score:.2f} ==========\n")
+    return success
 
 def main():
-    if not HF_TOKEN and API_BASE_URL == "https://api.openai.com/v1":
-        print("[ERROR] HF_TOKEN not set.", file=sys.stderr)
-        sys.exit(1)
-
-    client = build_client()
+    if not os.environ.get("OPENAI_API_KEY") and not os.environ.get("HF_TOKEN"):
+        logger.warning("No API Key provided.")
+    
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "dummy"), base_url=API_BASE_URL)
     env = CloudSREEnv()
 
-    for task_id in TASKS:
-        run_task(client, env, task_id)
+    TASKS = ["task1_status_audit", "task2_self_healing", "task3_latency_resolution"]
+    
+    for task in TASKS:
+        run_multi_agent_task(client, env, task)
 
 if __name__ == "__main__":
     main()
-
