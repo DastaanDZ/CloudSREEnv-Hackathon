@@ -63,49 +63,53 @@ PROMPTS = {
     "L2_DB_SME": L2_PROMPT
 }
 
-# Scenario messages for training dataset diversity
-# These are designed to teach the correct workflow for each role
+# Scenario messages for training - NO explicit action hints!
+# The model must learn to infer correct actions from context alone.
 SCENARIO_MESSAGES = {
     "IC": [
-        # Initial alerts - IC should delegate to L1_Triage
-        "INITIAL ALERT: payment-db status transition to Error detected. Delegate investigation to L1_Triage.",
-        "SYSTEM ALERT: High latency (850ms) detected on auth-api. Send L1_Triage to investigate.",
-        "ESCALATION: Multiple services reporting failures. Ask L1_Triage to list services and check logs.",
+        # Initial alerts - model should learn IC delegates to L1 first
+        "INITIAL ALERT: payment-db status transition to Error detected.",
+        "SYSTEM ALERT: High latency (850ms) detected on auth-api.",
+        "ESCALATION: Multiple services reporting upstream failures.",
+        "ALERT: notification-worker showing degraded performance.",
+        "INCIDENT: auth-api returning 503 errors to users.",
         
-        # After L1 reports - IC should delegate to L2_DB_SME  
-        "L1_Triage found root cause: payment-db crashed with OOMKilled. Tell L2_DB_SME to restart payment-db.",
-        "L1_Triage reports: auth-api at 99.8% CPU causing latency. Tell L2_DB_SME to scale auth-api to 2048.",
-        "L1_Triage identified: inventory-svc failing due to payment-db Error. Direct L2_DB_SME to restart payment-db.",
+        # After L1 investigation - model should learn IC delegates to L2 for fixes
+        "L1_Triage reports: payment-db is in CrashLoopBackOff. Logs show OOMKilled error.",
+        "L1_Triage found: auth-api at 99.8% CPU under high RPS load.",
+        "L1_Triage identified root cause: payment-db crashed, causing upstream failures.",
+        "L1_Triage diagnostic: inventory-svc failing due to payment-db being in Error state.",
         
-        # After L2 confirms fix - IC should close incident
-        "L2_DB_SME reports: Fix applied. payment-db restarted successfully. Close the incident now.",
-        "L2_DB_SME confirms: auth-api scaled to 2048 CPU. Latency resolved. Close incident.",
-        "Status: All services healthy after L2_DB_SME applied fix. Close the incident.",
+        # After L2 fix - model should learn IC closes incident
+        "L2_DB_SME confirms: payment-db has been restarted and is now Running.",
+        "L2_DB_SME reports: auth-api scaled to 2048 CPU, latency back to normal.",
+        "UPDATE: All services now healthy. L2_DB_SME applied the fix successfully.",
     ],
     "L1_Triage": [
-        # Investigation requests - L1 should use LIST_SERVICES
-        "IC Message: Investigate cluster state. Use LIST_SERVICES to see all pod statuses.",
-        "IC Message: We have alerts firing. Run LIST_SERVICES to identify which services are affected.",
-        "IC Message: Start investigation. First action should be LIST_SERVICES.",
+        # Investigation context - model should learn L1 uses LIST_SERVICES/GET_LOGS
+        "IC says: We have an incident. What's the cluster status?",
+        "IC says: Something is wrong with the services. Investigate.",
+        "IC says: Users are reporting errors. Find out what's happening.",
+        "IC says: Check the system health.",
         
-        # Specific service checks - L1 should use GET_LOGS
-        "IC Message: Check payment-db for errors. Use GET_LOGS on payment-db.",
-        "IC Message: Users report slow logins. Get logs from auth-api to find the cause.",
-        "IC Message: Investigate payment-db crash. Run GET_LOGS on payment-db.",
-        "IC Message: notification-worker is slow. Use GET_LOGS to check notification-worker.",
-        "IC Message: 503 errors detected. Get logs from inventory-svc to diagnose.",
+        # Specific investigation - model should learn to GET_LOGS on mentioned service
+        "IC says: payment-db might be the issue. Check it out.",
+        "IC says: Look into auth-api, users report slow logins.",
+        "IC says: Investigate why notification-worker is slow.",
+        "IC says: inventory-svc is showing errors. Find the root cause.",
+        "IC says: We need logs from payment-db to understand the crash.",
     ],
     "L2_DB_SME": [
-        # Restart requests - L2 should use RESTART
-        "IC Message: payment-db is crashed. Apply RESTART to payment-db immediately.",
-        "IC Message: Root cause is payment-db OOMKilled. Restart payment-db now.",
-        "IC Message: inventory-svc needs restart. Use RESTART on inventory-svc.",
-        "IC Message: Database crashed. Execute RESTART on payment-db.",
+        # Fix context - model should learn L2 uses RESTART for crashes
+        "IC says: payment-db is crashed and needs to be fixed.",
+        "IC says: The database is in Error state. Recover it.",
+        "IC says: payment-db OOMKilled. Bring it back online.",
+        "IC says: inventory-svc is down. Fix it.",
         
-        # Scale requests - L2 should use SCALE
-        "IC Message: auth-api needs more CPU. Scale auth-api to 2048.",
-        "IC Message: High latency on auth-api due to CPU. Use SCALE with cpu_value 2048 on auth-api.",
-        "IC Message: payment-db under heavy load. Scale payment-db CPU to 2048.",
-        "IC Message: Performance issue identified. Apply SCALE to auth-api with cpu_value 2048.",
+        # Scale context - model should learn L2 uses SCALE for performance
+        "IC says: auth-api is overloaded and needs more resources.",
+        "IC says: High CPU on auth-api causing latency. Fix the performance.",
+        "IC says: payment-db needs more CPU to handle the load.",
+        "IC says: Scale up auth-api to resolve the bottleneck.",
     ],
 }

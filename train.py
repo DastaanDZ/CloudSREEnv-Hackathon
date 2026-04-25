@@ -131,104 +131,126 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         role = _detect_role_from_prompt(prompt_str)
         prompt_lower = prompt_str.lower()
         
+        # Detect context phases
+        is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
+        is_after_investigation = any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
+        is_after_fix = any(kw in prompt_lower for kw in ["l2_db_sme confirms", "l2_db_sme reports", "all services now healthy", "fix successfully", "restarted and is now", "scaled to"])
+        
         # --- IC Workflow ---
         if role == "IC":
             if action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
-                # IC should delegate to L1 for investigation
-                if "initial alert" in prompt_lower or "system alert" in prompt_lower:
+                message = action_dict.get("message", "")
+                
+                if is_initial_alert:
+                    # On initial alert, IC MUST delegate to L1
                     if target == "L1_Triage":
-                        reward += 0.25  # Correct: delegate investigation
+                        reward += 0.50  # Strong reward for correct delegation
                     elif target == "L2_DB_SME":
-                        reward += 0.10  # Acceptable but not ideal first step
-                # IC should delegate to L2 when root cause is known
-                elif "root cause" in prompt_lower or "found" in prompt_lower or "reports:" in prompt_lower:
+                        reward += 0.15  # Acceptable but skipping investigation
+                    else:
+                        reward -= 0.10
+                        
+                elif is_after_investigation:
+                    # After L1 reports, IC should delegate to L2
                     if target == "L2_DB_SME":
-                        reward += 0.30  # Correct: delegate fix to L2
+                        reward += 0.50  # Correct: delegate fix
                     elif target == "L1_Triage":
-                        reward -= 0.10  # Wrong: already have diagnosis
+                        reward -= 0.15  # Wrong: already have diagnosis
+                else:
+                    reward += 0.20  # Generic delegation is okay
                         
             elif action_type == "CLOSE_INCIDENT":
-                # Only close when fix is confirmed
-                if "fix applied" in prompt_lower or "restarted" in prompt_lower or "scaled" in prompt_lower or "healthy" in prompt_lower:
-                    reward += 0.35  # Correct: close after fix confirmed
+                # CLOSE_INCIDENT only appropriate after fix confirmed
+                if is_after_fix:
+                    reward += 0.45  # Correct timing
+                elif is_initial_alert:
+                    reward -= 0.60  # VERY WRONG: closing on first alert!
+                elif is_after_investigation:
+                    reward -= 0.40  # Wrong: need to fix first
                 else:
-                    reward -= 0.25  # Premature closure
+                    reward -= 0.30  # Probably premature
                     
             elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE"]:
-                reward -= 0.20  # IC shouldn't do these directly
+                reward -= 0.30  # IC shouldn't do these directly
         
         # --- L1_Triage Workflow ---
         elif role == "L1_Triage":
             if action_type == "LIST_SERVICES":
-                # L1 should list services when asked to investigate
-                if "investigate" in prompt_lower or "check" in prompt_lower or "audit" in prompt_lower or "list" in prompt_lower:
-                    reward += 0.35  # Correct diagnostic action
-                else:
-                    reward += 0.15  # Still valid
+                # L1 should always be willing to list services
+                reward += 0.45  # Strong reward for diagnostic action
+                if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
+                    reward += 0.15  # Extra for matching context
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if service_id in VALID_SERVICES:
-                    reward += 0.30  # Correct diagnostic action
+                    reward += 0.45  # Correct diagnostic action
                     # Extra if service matches context
-                    if service_id.replace("-", "") in prompt_lower.replace("-", ""):
-                        reward += 0.15
+                    service_mentioned = service_id.replace("-", "").lower()
+                    if service_mentioned in prompt_lower.replace("-", ""):
+                        reward += 0.20  # Investigating the right service
+                elif service_id:
+                    reward -= 0.15  # Hallucinated service name
                 else:
-                    reward -= 0.10  # Hallucinated service
+                    reward -= 0.20  # Missing service_id
                     
             elif action_type == "MESSAGE_CHANNEL":
-                # L1 should only message AFTER doing diagnostics
-                # Penalize if prompt suggests they should be investigating
-                if "investigate" in prompt_lower or "check" in prompt_lower or "list" in prompt_lower or "get logs" in prompt_lower:
-                    reward -= 0.20  # Should do diagnostics first!
-                else:
-                    reward += 0.10  # Reporting findings is okay
+                # L1 messaging is okay but not as good as investigating
+                reward += 0.10
                     
             elif action_type == "CLOSE_INCIDENT":
-                reward -= 0.40  # L1 should NEVER close incidents
+                reward -= 0.60  # L1 should NEVER close incidents
                 
             elif action_type in ["RESTART", "SCALE"]:
-                reward -= 0.35  # L1 has no write permissions
+                reward -= 0.50  # L1 has no write permissions - RBAC violation
         
         # --- L2_DB_SME Workflow ---
         elif role == "L2_DB_SME":
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if service_id in VALID_SERVICES:
-                    reward += 0.35  # Correct fix action
-                    if "restart" in prompt_lower or "crash" in prompt_lower or "error" in prompt_lower:
-                        reward += 0.15  # Matches requested action
+                    reward += 0.45  # Correct fix action
+                    # Extra if context mentions crash/error/down
+                    if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
+                        reward += 0.20
+                    # Extra if service matches
+                    if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
+                        reward += 0.15
+                elif service_id:
+                    reward -= 0.10  # Wrong service
                 else:
-                    reward -= 0.10
+                    reward -= 0.25  # Missing service_id
                     
             elif action_type == "SCALE":
                 service_id = action_dict.get("service_id", "")
                 cpu_value = action_dict.get("cpu_value")
+                
                 if service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
-                        reward += 0.35  # Correct scale value
+                        reward += 0.45  # Correct scale value
                     elif cpu_value >= 1024:
-                        reward += 0.15
+                        reward += 0.20
                     else:
-                        reward -= 0.10  # Too low
-                    if "scale" in prompt_lower or "cpu" in prompt_lower or "latency" in prompt_lower:
+                        reward -= 0.10  # Too low to help
+                        
+                    # Context match
+                    if any(kw in prompt_lower for kw in ["cpu", "resource", "overload", "performance", "latency", "scale"]):
+                        reward += 0.20
+                    if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
                         reward += 0.15
                 else:
-                    reward -= 0.15
+                    reward -= 0.20  # Missing required fields
                     
             elif action_type == "MESSAGE_CHANNEL":
-                # L2 should message only AFTER applying fix
-                if "apply" in prompt_lower or "fix" in prompt_lower or "restart" in prompt_lower or "scale" in prompt_lower:
-                    reward -= 0.15  # Should fix first, not just message!
-                else:
-                    reward += 0.10  # Reporting completion is okay
+                # L2 should fix, not just message
+                reward -= 0.10
                     
             elif action_type == "CLOSE_INCIDENT":
-                reward -= 0.40  # L2 should NEVER close incidents
+                reward -= 0.60  # L2 should NEVER close incidents
                 
             elif action_type in ["LIST_SERVICES", "GET_LOGS"]:
-                reward -= 0.15  # L2 should act, not investigate
+                reward -= 0.25  # L2 should act, not investigate
         
         # =====================================================================
         # STAGE 7: Field completeness validation
@@ -321,8 +343,8 @@ def main():
         torch_dtype=torch.float16
     ).to(DEVICE)
     
-    # Build diverse training dataset (500 samples by default)
-    dataset = build_dataset(num_samples=500)
+    # Build diverse training dataset
+    dataset = build_dataset(num_samples=800)
 
     peft_config = LoraConfig(
         r=16,
@@ -334,19 +356,18 @@ def main():
     # --- GRPO Training Configuration ---
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
-        learning_rate=5e-5,           # Increased LR for faster convergence
+        learning_rate=3e-5,           # Moderate LR for stable convergence
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4, # More accumulation for stability
-        num_generations=4, 
-        generation_batch_size=4, 
-        logging_steps=5,
-        max_steps=150,                # More steps to learn workflow patterns
+        gradient_accumulation_steps=4,
+        num_generations=6,            # More generations for better variance
+        generation_batch_size=6, 
+        logging_steps=10,
+        max_steps=200,                # More steps for workflow learning
         report_to="none",
         fp16=True, 
         gradient_checkpointing=True,
-        max_completion_length=64,     # Limit verbosity - force concise JSON
-        # Temperature for generation diversity
-        temperature=0.7,
+        max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
+        temperature=0.9,              # Higher temp for more diverse exploration
     )
     
     trainer = GRPOTrainer(
