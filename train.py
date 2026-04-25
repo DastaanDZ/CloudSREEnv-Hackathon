@@ -241,8 +241,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     # Already reported - don't message again
                     manual_reward -= 0.20
                 elif not has_service_list and not has_log_content:
-                    # Haven't investigated at all - should investigate first
-                    manual_reward -= 0.15
+                    # Haven't investigated at all - L1 must NEVER report without evidence
+                    manual_reward -= 0.40
                 else:
                     manual_reward += 0.10
                     

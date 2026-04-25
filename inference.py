@@ -158,7 +158,29 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                     agent_histories[current_agent] += "\n[SYSTEM] You already delegated to L2. Wait for L2's response or try CLOSE_INCIDENT if the fix was applied."
                 else:
                     agent_histories[current_agent] += "\n[SYSTEM] Try a different action. Delegate fix to L2_DB_SME or close the incident."
-        
+
+        # Safety net: L1 must investigate before reporting to IC.
+        # Without this, L1 can shortcut by messaging IC immediately, which derails
+        # task1 (no GET_LOGS evidence -> CLOSE_INCIDENT rejected) and wastes turns.
+        if (current_agent == "L1_Triage"
+                and action.action_type == ActionType.MESSAGE_CHANNEL
+                and action.target == "IC"):
+            prior_actions = recent_actions[current_agent][:-1]
+            has_investigated = any(
+                k.startswith("GET_LOGS") or k.startswith("LIST_SERVICES")
+                for k in prior_actions
+            )
+            if not has_investigated:
+                logger.warning(f"L1 attempted to report to IC without investigation. Rejecting.")
+                recent_actions[current_agent].pop()
+                agent_histories[current_agent] += (
+                    "\n[SYSTEM] You must investigate before reporting. "
+                    "Run GET_LOGS on the suspected service first "
+                    "(auth-api for login/auth failures, payment-db for crashes/OOM, "
+                    "auth-api for high latency/CPU)."
+                )
+                continue
+
         step_obs, _, done, _ = env.step(action)
         
         if action.action_type == ActionType.MESSAGE_CHANNEL:
