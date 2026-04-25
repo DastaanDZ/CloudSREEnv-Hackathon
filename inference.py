@@ -1,77 +1,79 @@
 """
 inference.py — Evaluator for Local GRPO-Trained Models
+Supports both 'BASE' model evaluation and 'TRAINED' adapter evaluation.
 """
 
 from __future__ import annotations
-
-import json
-import os
-import re
-import logging
-import torch
+import json, os, re, logging, torch
 from typing import Dict, List
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from server.app import Action, ActionType, CloudSREEnv
 
 # --- Setup Logging ---
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger("Evaluator")
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 1. EVALUATION CONFIGURATION
 # ---------------------------------------------------------------------------
+# TOGGLE THIS: Use "BASE" to generate 'Before' logs, "TRAINED" for 'After' logs.
+EVAL_MODE = "TRAINED" 
 
-# Point this to your trained adapter folder
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
-# The original base model we started with
 BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
-# Prompts (Same as Training)
+# 2. PROMPTS (Shared with train.py)
 # ---------------------------------------------------------------------------
+IC_PROMPT = """You are the Incident Commander (IC). Orchestrate the response.
+- Task1: Once L1_Triage reports logs, use CLOSE_INCIDENT.
+- Task2/3: Tell L2_DB_SME the service_id (e.g. payment-db) to fix.
+- Use CLOSE_INCIDENT once fixed."""
 
-IC_PROMPT = """You are the Incident Commander (IC). You orchestrate the response.
-- If the Current Task is task1, once L1_Triage reports logs, use CLOSE_INCIDENT.
-- If the Task is task2/task3, explicitly tell L2_DB_SME the service_id (e.g. payment-db) to fix.
-- Once L2_DB_SME reports success, use CLOSE_INCIDENT."""
-
-L1_PROMPT = """You are the L1 Triage Agent. You monitor cluster health.
-1. Run LIST_SERVICES.
-2. Run GET_LOGS on suspicious pods.
-3. Use MESSAGE_CHANNEL to escalate findings to the IC."""
+L1_PROMPT = """You are the L1 Triage Agent. Monitor cluster health.
+1. Run LIST_SERVICES. 2. Run GET_LOGS on suspicious pods. 3. MESSAGE_CHANNEL to IC."""
 
 L2_PROMPT = """You are the L2 Database SME.
-- If crashing, use RESTART.
-- If high CPU, use SCALE to 2048.
-- Once [OK], use MESSAGE_CHANNEL to tell IC 'fix applied'."""
+- If crashing: RESTART. - If high CPU: SCALE to 2048. - Use MESSAGE_CHANNEL to tell IC 'fix applied'."""
 
 PROMPTS = {"IC": IC_PROMPT, "L1_Triage": L1_PROMPT, "L2_DB_SME": L2_PROMPT}
 
 # ---------------------------------------------------------------------------
-# Local Model Loader
+# 3. CORE EVALUATION FUNCTIONS (Encapsulated)
 # ---------------------------------------------------------------------------
+def load_eval_model(mode="TRAINED"):
+    """
+    Loads the model only when explicitly called. 
+    Prevents train.py from crashing on import.
+    """
+    logger.info(f"--- LOADING MODEL IN {mode} MODE ---")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-logger.info(f"Loading Local Model from {TRAINED_MODEL_PATH}...")
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+    # Load the pure base model weights
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME, 
+        torch_dtype=torch.float16
+    ).to(DEVICE)
 
-# Load Base + LoRA Adapters
-base_model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME, torch_dtype=torch.float16).to(DEVICE)
-model = PeftModel.from_pretrained(base_model, TRAINED_MODEL_PATH).to(DEVICE)
-model.eval()
+    if mode == "TRAINED":
+        if not os.path.exists(TRAINED_MODEL_PATH):
+            raise FileNotFoundError(f"Trained model not found at {TRAINED_MODEL_PATH}. Train first!")
+        logger.info(f"Applying LoRA Adapters from {TRAINED_MODEL_PATH}...")
+        model = PeftModel.from_pretrained(model, TRAINED_MODEL_PATH).to(DEVICE)
+    
+    model.eval()
+    return model, tokenizer
 
-def generate_action(agent_role: str, history: str) -> str:
-    """Generates a response from the locally trained model."""
+def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
+    """Generates a response from the loaded model (Base or Trained)."""
     system_prompt = PROMPTS[agent_role]
-    full_input = f"{system_prompt}\n\n{history}\n\nAssistant:"
+    # Llama 3 format
+    full_input = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+    full_input += f"<|start_header_id|>user<|end_header_id|>\n\n{history}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     
     inputs = tokenizer(full_input, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
@@ -79,75 +81,74 @@ def generate_action(agent_role: str, history: str) -> str:
             **inputs, 
             max_new_tokens=128, 
             pad_token_id=tokenizer.eos_token_id,
-            do_sample=False # Greedy decoding for consistent eval
+            do_sample=False
         )
     
-    # Decode only the newly generated part
+    # Extract only the newly generated tokens
     new_tokens = output_tokens[0][len(inputs["input_ids"][0]):]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-# ---------------------------------------------------------------------------
-# Orchestration Loop
-# ---------------------------------------------------------------------------
-
-def run_multi_agent_task(env: CloudSREEnv, task_id: str):
+def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
     
-    # Track history per agent for the session
     agent_histories = {agent: f"INITIAL ALERT:\n{obs.text_output}" for agent in PROMPTS}
     current_agent = "IC"
-    
-    success = False
     max_steps = 15
 
     for step_n in range(1, max_steps + 1):
         logger.info(f"Turn {step_n}: {current_agent} is Thinking...")
         
-        raw_reply = generate_action(current_agent, agent_histories[current_agent])
-        logger.debug(f"RAW OUTPUT: {raw_reply}")
-
-        # Extract JSON logic
+        raw_reply = generate_action(current_agent, agent_histories[current_agent], model, tokenizer)
+        
+        # Regex to find JSON blocks
         json_match = re.search(r'\{.*\}', raw_reply, re.DOTALL)
-        clean_json_str = json_match.group(0) if json_match else raw_reply
+        clean_json_str = json_match.group(0) if json_match else "{}"
 
         try:
             action_dict = json.loads(clean_json_str)
             action_dict["agent_id"] = current_agent 
             action = Action(**action_dict)
         except Exception as e:
-            logger.error(f"PARSE ERROR: {e} | Raw: {raw_reply}")
-            agent_histories[current_agent] += f"\nError: Your last output was not valid JSON."
+            logger.warning(f"PARSE ERROR: {e} | Content: {raw_reply[:50]}...")
+            agent_histories[current_agent] += f"\nError: Your output was not valid JSON."
             continue
 
-        logger.info(f"ACTION: {action.action_type} -> {action.target if action.target else action.service_id}")
-
-        # Environment Step
-        step_obs, reward, done, _ = env.step(action)
+        logger.info(f"ACTION: {action.action_type} -> {action.target or action.service_id}")
+        step_obs, _, done, _ = env.step(action)
         
-        # Update Histories
         if action.action_type == ActionType.MESSAGE_CHANNEL:
-            target = action.target
-            msg = f"\nNew channel message from {current_agent}: {action.message}"
-            agent_histories[target] += msg
-            current_agent = target # Hand off
+            msg = f"\nNew message from {current_agent}: {action.message}"
+            agent_histories[action.target] += msg
+            current_agent = action.target 
         elif action.action_type == ActionType.CLOSE_INCIDENT:
             if done:
-                logger.info("SUCCESS: Incident Closed.")
-                success = True
-                break
+                logger.info(f"SUCCESS: {task_id} CLOSED SUCCESSFULLY.")
+                return True
             else:
-                agent_histories[current_agent] += f"\nObservation: {step_obs.text_output}"
+                agent_histories[current_agent] += f"\nObs: Cannot close yet. {step_obs.text_output}"
         else:
-            agent_histories[current_agent] += f"\nObservation: {step_obs.text_output}"
+            agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
 
-    return success
+    logger.error(f"FAILURE: {task_id} exceeded max steps.")
+    return False
 
+# ---------------------------------------------------------------------------
+# 4. MAIN EXECUTION
+# ---------------------------------------------------------------------------
 def main():
+    # 1. Load the model (Mode based on EVAL_MODE at top)
+    model, tokenizer = load_eval_model(mode=EVAL_MODE)
+    
+    # 2. Run scenarios
     env = CloudSREEnv()
     tasks = ["task1_status_audit", "task2_self_healing", "task3_latency_resolution"]
+    
+    results = {}
     for task in tasks:
-        run_multi_agent_task(env, task)
+        results[task] = run_multi_agent_task(env, task, model, tokenizer)
+    
+    logger.info(f"FINAL RESULTS ({EVAL_MODE}): {results}")
 
 if __name__ == "__main__":
     main()
