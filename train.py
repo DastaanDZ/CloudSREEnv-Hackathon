@@ -199,16 +199,16 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                  "cpu usage", "rps=", "503 service unavailable"])
             has_reported = any(kw in prompt_lower for kw in 
                 ["found:", "identified", "reports:", "root cause", "report findings"])
+            is_login_context = any(kw in prompt_lower for kw in ["login failure", "authentication failure", "authentication flow"])
             
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
-                    # Already have logs/findings - don't list again, report to IC!
                     manual_reward -= 0.40
                 elif has_service_list:
-                    # Already listed services - should GET_LOGS now, not list again
                     manual_reward -= 0.25
+                    if is_login_context:
+                        manual_reward -= 0.10
                 else:
-                    # Fresh investigation - LIST_SERVICES is correct first step
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
                         manual_reward += 0.15
@@ -216,13 +216,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if has_log_content or has_reported:
-                    # Already have log content - don't keep getting logs, report to IC!
                     manual_reward -= 0.40
                 elif service_id in VALID_SERVICES:
-                    # GET_LOGS is correct after LIST_SERVICES or at start
                     manual_reward += 0.45
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
                         manual_reward += 0.20
+                    if is_login_context and service_id == "auth-api":
+                        manual_reward += 0.25
                 elif service_id:
                     manual_reward -= 0.15
                 else:

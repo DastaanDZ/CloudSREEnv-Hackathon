@@ -119,7 +119,8 @@ class MockCloud:
     def _apply_tls_certificate_expiry(self):
         svc = self.services["auth-api"]
         svc.status = "Running"
-        svc.latency_ms = 45
+        svc.latency_ms = 350
+        svc.error_message = "Warning: authentication failures detected; inspect auth-api logs."
         svc.logs = [
             "[ERROR] TLS handshake failed: certificate has expired",
             "[ERROR] x509: certificate signed by unknown authority",

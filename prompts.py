@@ -39,7 +39,8 @@ Available Actions:
 
 Workflow:
 1. Run LIST_SERVICES to see cluster state.
-2. Run GET_LOGS on any service showing Error or high latency.
+2. Run GET_LOGS on any service showing Error, high latency, or warnings.
+   If users report login/authentication failures, inspect auth-api logs even if status shows Running.
 3. Report root cause and affected service to IC."""
 
 L2_PROMPT = f"""{SIM_PREFIX}
@@ -90,8 +91,11 @@ SCENARIO_MESSAGES = {
         "New message from IC: Users reporting login failures. Investigate the authentication flow.",
         "New message from IC: Users reporting errors. Investigate and report back.",
         
-        # After LIST_SERVICES - should GET_LOGS on suspicious service
-        "New message from IC: Investigate.\nObs: auth-api              Running    45ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",
+        # Task1: After LIST_SERVICES with login context - auth-api shows high latency, should GET_LOGS(auth-api)
+        "New message from IC: Investigate login failures in the authentication flow.\nObs: auth-api              Running    350ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",
+        "New message from IC: Users reporting authentication failures. Check auth-api.\nObs: auth-api              Running    350ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",
+        
+        # Task2: After LIST_SERVICES - payment-db shows Error
         "New message from IC: Investigate.\nObs: auth-api              Running    45ms\npayment-db            Error      0ms\ninventory-svc         Running    120ms",
         
         # Task1: TLS Certificate logs - should MESSAGE_CHANNEL to IC (no fix needed)

@@ -98,17 +98,27 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         
         raw_reply = generate_action(current_agent, agent_histories[current_agent], model, tokenizer)
         
-        # Regex to find JSON blocks
-        json_match = re.search(r'\{.*\}', raw_reply, re.DOTALL)
-        clean_json_str = json_match.group(0) if json_match else "{}"
+        # Extract the first valid JSON object (handles multi-JSON output)
+        action_dict = None
+        try:
+            decoder = json.JSONDecoder()
+            start = raw_reply.find('{')
+            if start != -1:
+                action_dict, _ = decoder.raw_decode(raw_reply, start)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        if not action_dict or not isinstance(action_dict, dict):
+            logger.warning(f"PARSE ERROR: No valid JSON | Content: {raw_reply[:80]}...")
+            agent_histories[current_agent] += "\n[SYSTEM] Error: Output ONE valid JSON object. No prose, no multiple objects."
+            continue
 
         try:
-            action_dict = json.loads(clean_json_str)
             action_dict["agent_id"] = current_agent 
             action = Action(**action_dict)
         except Exception as e:
             logger.warning(f"PARSE ERROR: {e} | Content: {raw_reply[:50]}...")
-            agent_histories[current_agent] += f"\nError: Your output was not valid JSON."
+            agent_histories[current_agent] += "\n[SYSTEM] Error: Invalid action fields. Output ONE valid JSON object."
             continue
 
         logger.info(f"ACTION: {action.action_type} -> {action.target or action.service_id}")
