@@ -80,9 +80,10 @@ SCENARIO_MESSAGES = {
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: Root cause found. payment-db is in CrashLoopBackOff with OOMKilled error.",
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db Error.\nNew message from L1_Triage: payment-db OOMKilled.\nNew message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
         
-        # Task3: High latency (needs SCALE)
+        # Task3: High latency (needs SCALE) - IC must delegate to L2 after L1 report
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency (850ms) detected on auth-api.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api at 99.8% CPU. Needs scaling.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api CPU overloaded, latency 850ms. Needs scaling to 2048 CPU.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency.\nNew message from L1_Triage: auth-api overloaded.\nNew message from L2_DB_SME: auth-api scaled to 2048 CPU. Latency resolved.",
     ],
     "L1_Triage": [

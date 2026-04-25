@@ -135,7 +135,13 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             elif current_agent == "L2_DB_SME":
                 agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
             elif current_agent == "IC":
-                agent_histories[current_agent] += "\n[SYSTEM] Waiting for updates. Check if incident can be closed."
+                last_action_key = recent_actions[current_agent][-1]
+                if "CLOSE_INCIDENT" in last_action_key:
+                    agent_histories[current_agent] += "\n[SYSTEM] Incident cannot be closed yet. If L1 reported a fixable issue, delegate the fix to L2_DB_SME."
+                elif "MESSAGE_CHANNEL:L1_Triage" in last_action_key:
+                    agent_histories[current_agent] += "\n[SYSTEM] You already delegated to L1. If L1 reported findings, delegate the fix to L2_DB_SME using MESSAGE_CHANNEL."
+                else:
+                    agent_histories[current_agent] += "\n[SYSTEM] Try a different action. If investigation is complete, delegate fix to L2_DB_SME or close the incident."
         
         step_obs, _, done, _ = env.step(action)
         
@@ -151,7 +157,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 logger.info(f"SUCCESS: {task_id} CLOSED SUCCESSFULLY.")
                 return True
             else:
-                agent_histories[current_agent] += f"\nObs: Cannot close yet. {step_obs.text_output}"
+                agent_histories[current_agent] += f"\nObs: {step_obs.text_output} The issue is not yet resolved. Delegate the fix to L2_DB_SME if not already done."
         else:
             agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
 
