@@ -278,20 +278,22 @@ class CloudSREEnv:
         if action.action_type == ActionType.INVALID_FORMAT:
             return -0.5, {"syntax_penalty": -0.5}, "Invalid JSON format."
 
-        # 2. Duplicate Action Penalty (penalize same action by same agent)
-        # Note: Current action is already appended to history, so compare with [-2]
-        if len(self.action_history) >= 2:
-            prev_action = self.action_history[-2]
-            is_duplicate = (
-                prev_action.action_type == action.action_type and
-                prev_action.agent_id == action.agent_id and
-                prev_action.service_id == action.service_id and
-                prev_action.target == action.target
-            )
-            if is_duplicate:
-                reward -= 0.15
-                breakdown["duplicate_penalty"] = -0.15
-                reason = "Repeated same action."
+        # 2. Escalating Duplicate Penalty (penalize consecutive same action by same agent)
+        # Note: Current action is already appended to history, so skip [-1]
+        consecutive = 0
+        for prev in reversed(self.action_history[:-1]):
+            if (prev.action_type == action.action_type and
+                prev.agent_id == action.agent_id and
+                prev.service_id == action.service_id and
+                prev.target == action.target):
+                consecutive += 1
+            else:
+                break
+        if consecutive >= 1:
+            penalty = -0.15 * consecutive
+            reward += penalty
+            breakdown["duplicate_penalty"] = penalty
+            reason = f"Repeated same action {consecutive + 1}x."
 
         # 3. Tool-Use Rubric (Reward discovery and communication)
         if action.action_type in [ActionType.LIST_SERVICES, ActionType.GET_LOGS]:
