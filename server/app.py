@@ -192,7 +192,24 @@ class CloudSREEnv:
 
         self.action_history.append(action)
         obs_text = ""
-        
+
+        # --- HARD DUPLICATE BLOCK ---
+        # Reject any repeat of an action already taken this episode (per-type key).
+        # Side effects, rubric, and RBAC are all skipped; the agent gets a clear
+        # signal to pick a different action. INVALID_FORMAT and CLOSE_INCIDENT
+        # have their own dedicated logic and are intentionally exempt.
+        if (action.action_type not in (ActionType.INVALID_FORMAT, ActionType.CLOSE_INCIDENT)
+                and self._is_duplicate(action)):
+            block_reward = -0.4
+            block_breakdown = {"duplicate_block": block_reward}
+            obs = "[BLOCKED] Duplicate action. You already did this. Choose a different action or report findings."
+            return (
+                Observation(text_output=obs),
+                Reward(value=block_reward, reason="Duplicate action blocked.", breakdown=block_breakdown),
+                False,
+                {},
+            )
+
         # --- NEW: OPENENV COMPOSABLE RUBRIC EVALUATION ---
         total_reward, breakdown, reason = self._calculate_rubric(action)
 
@@ -267,6 +284,32 @@ class CloudSREEnv:
         
         return Observation(text_output=obs_text), Reward(value=capped_reward, reason=reason, breakdown=breakdown), self.done, {}
 
+    def _action_match_key(self, action: Action) -> tuple:
+        """Per-type identity used for hard-duplicate detection.
+
+        - LIST_SERVICES: (type, agent)
+        - GET_LOGS / RESTART: (type, agent, service)
+        - SCALE: (type, agent, service, cpu_value)  -- different cpu_value is allowed
+        - MESSAGE_CHANNEL: (type, agent, target)    -- message text intentionally ignored
+        """
+        if action.action_type == ActionType.SCALE:
+            return (action.action_type, action.agent_id, action.service_id, action.cpu_value)
+        if action.action_type == ActionType.MESSAGE_CHANNEL:
+            return (action.action_type, action.agent_id, action.target)
+        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART):
+            return (action.action_type, action.agent_id, action.service_id)
+        return (action.action_type, action.agent_id)
+
+    def _is_duplicate(self, action: Action) -> bool:
+        """True if any prior action this episode matches the current action's key."""
+        key = self._action_match_key(action)
+        for prev in self.action_history[:-1]:
+            if prev.action_type in (ActionType.INVALID_FORMAT, ActionType.CLOSE_INCIDENT):
+                continue
+            if self._action_match_key(prev) == key:
+                return True
+        return False
+
     # --- DENSE REWARD RUBRIC ---
     def _calculate_rubric(self, action: Action) -> tuple[float, dict, str]:
         """Calculates dense rewards for RL training."""
@@ -278,24 +321,8 @@ class CloudSREEnv:
         if action.action_type == ActionType.INVALID_FORMAT:
             return -0.5, {"syntax_penalty": -0.5}, "Invalid JSON format."
 
-        # 2. Escalating Duplicate Penalty (penalize consecutive same action by same agent)
-        # Note: Current action is already appended to history, so skip [-1]
-        consecutive = 0
-        for prev in reversed(self.action_history[:-1]):
-            if (prev.action_type == action.action_type and
-                prev.agent_id == action.agent_id and
-                prev.service_id == action.service_id and
-                prev.target == action.target):
-                consecutive += 1
-            else:
-                break
-        if consecutive >= 1:
-            penalty = -0.15 * consecutive
-            reward += penalty
-            breakdown["duplicate_penalty"] = penalty
-            reason = f"Repeated same action {consecutive + 1}x."
-
-        # 3. Tool-Use Rubric (Reward discovery and communication)
+        # 2. Tool-Use Rubric (Reward discovery and communication)
+        # Note: duplicate detection is now a hard block in step(), not a soft penalty here.
         if action.action_type in [ActionType.LIST_SERVICES, ActionType.GET_LOGS]:
             reward += 0.05
             breakdown["tool_discovery"] = 0.05
@@ -306,7 +333,7 @@ class CloudSREEnv:
             breakdown["collaboration"] = 0.1
             reason = "Communicated in channel."
 
-        # 4. RBAC Rubric (Strictly enforce roles)
+        # 3. RBAC Rubric (Strictly enforce roles)
         if action.action_type in [ActionType.RESTART, ActionType.SCALE]:
             if action.agent_id != "L2_DB_SME":
                 return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
@@ -315,7 +342,7 @@ class CloudSREEnv:
                 breakdown["authorized_action"] = 0.2
                 reason = "Executed authorized modification."
 
-        # 5. Time Penalty (Encourages efficiency)
+        # 4. Time Penalty (Encourages efficiency)
         time_penalty = -0.02 * self.steps_taken
         reward += time_penalty
         breakdown["time_penalty"] = time_penalty

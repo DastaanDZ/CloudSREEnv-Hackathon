@@ -182,7 +182,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 continue
 
         step_obs, _, done, _ = env.step(action)
-        
+
+        # If the env hard-blocked the action, surface the obs to the current agent
+        # and do NOT route (no message delivery, no current_agent switch).
+        if step_obs.text_output.startswith("[BLOCKED]"):
+            logger.warning(f"Env blocked duplicate action by {current_agent}.")
+            agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
+            continue
+
         if action.action_type == ActionType.MESSAGE_CHANNEL:
             if action.target not in agent_histories:
                 agent_histories[current_agent] += f"\n[ERROR] Invalid target '{action.target}'. Valid targets: IC, L1_Triage, L2_DB_SME"
