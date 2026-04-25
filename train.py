@@ -622,7 +622,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16, 
-        attn_implementation="flash_attention_2" 
+        attn_implementation="sdpa"  # <-- THIS IS THE MAGIC WORD
     ).to(DEVICE)
     
     # Build diverse training dataset
