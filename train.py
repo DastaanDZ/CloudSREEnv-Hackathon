@@ -9,6 +9,7 @@ import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
+from peft import LoraConfig
 
 # Import our environment and data models
 from server.app import CloudSREEnv, Action, ActionType
@@ -91,6 +92,13 @@ def main():
     
     dataset = build_dataset()
 
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="CAUSAL_LM",
+    )
+
     # --- GRPO Magic Settings ---
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
@@ -113,7 +121,8 @@ def main():
         reward_funcs=[sre_rubric_reward], 
         args=training_args,
         train_dataset=dataset,
-        processing_class=tokenizer
+        processing_class=tokenizer,
+        peft_config=peft_config
     )
 
     logger.info("\n========== STARTING GRPO RL TRAINING ==========")
