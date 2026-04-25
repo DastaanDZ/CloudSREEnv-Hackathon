@@ -83,19 +83,24 @@ SCENARIO_MESSAGES = {
         "INITIAL ALERT:\n[SYSTEM ALERT] Cascading failures.\nNew message from L2_DB_SME: payment-db restarted. All services recovering.",
     ],
     "L1_Triage": [
-        # Turn 2: IC delegated investigation to L1
+        # Turn 2: IC delegated investigation - should LIST_SERVICES or GET_LOGS
         "New message from IC: Investigate the cluster status. Find what's causing the alert.",
         "New message from IC: We have an incident with payment-db. Check it out.",
         "New message from IC: Users reporting errors. Investigate and report back.",
-        "New message from IC: Something is wrong. List services and check logs.",
         
-        # After LIST_SERVICES, need to GET_LOGS
-        "New message from IC: Investigate the incident.\nObs: auth-api              Running    45ms\npayment-db            Error      0ms\ninventory-svc         Running    120ms",
-        "New message from IC: Check the cluster.\nObs: auth-api              Running    850ms\npayment-db            Running    12ms",
+        # After LIST_SERVICES - should GET_LOGS on suspicious service
+        "New message from IC: Investigate.\nObs: auth-api              Running    45ms\npayment-db            Error      0ms\ninventory-svc         Running    120ms",
         
-        # After GET_LOGS, should report to IC
-        "New message from IC: Check payment-db.\nObs: auth-api   Running   payment-db   Error\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff",
-        "New message from IC: Investigate auth-api latency.\nObs: === Logs: auth-api ===\n[WARN] RPS=3500 — CPU usage 99.8%",
+        # CRITICAL: After GET_LOGS - should MESSAGE_CHANNEL to IC with findings
+        "New message from IC: Check payment-db.\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff",
+        "New message from IC: Check auth-api.\nObs: === Logs: auth-api ===\n[WARN] RPS=3500 — CPU usage 99.8%",
+        "New message from IC: Investigate.\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled",
+        "New message from IC: Check logs.\nObs: === Logs: inventory-svc ===\nCritical: 503 Service Unavailable - Upstream payment-db is down.",
+        
+        # Explicit "you have logs, now report" scenarios
+        "New message from IC: What did you find?\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff\n[SYSTEM] You have the logs. Report findings to IC.",
+        "New message from IC: Status?\nObs: auth-api at 99.8% CPU. High latency detected.\n[SYSTEM] Investigation complete. Message IC with your findings.",
+        "New message from IC: Report back.\nObs: payment-db crashed with OOMKilled. Root cause identified.",
     ],
     "L2_DB_SME": [
         # Turn 4: IC delegated fix to L2

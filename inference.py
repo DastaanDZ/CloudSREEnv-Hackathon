@@ -89,6 +89,9 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     agent_histories = {agent: f"INITIAL ALERT:\n{obs.text_output}" for agent in PROMPTS}
     current_agent = "IC"
     max_steps = 15
+    
+    # Track recent actions to detect repetition
+    recent_actions = {agent: [] for agent in PROMPTS}
 
     for step_n in range(1, max_steps + 1):
         logger.info(f"Turn {step_n}: {current_agent} is Thinking...")
@@ -109,6 +112,21 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             continue
 
         logger.info(f"ACTION: {action.action_type} -> {action.target or action.service_id}")
+        
+        # Track this action
+        action_key = f"{action.action_type}:{action.service_id or action.target or ''}"
+        recent_actions[current_agent].append(action_key)
+        
+        # Detect repetition (same action 2+ times)
+        if len(recent_actions[current_agent]) >= 2 and recent_actions[current_agent][-1] == recent_actions[current_agent][-2]:
+            logger.warning(f"Repetition detected for {current_agent}. Injecting hint.")
+            if current_agent == "L1_Triage":
+                agent_histories[current_agent] += "\n[SYSTEM] You have already gathered logs. Report your findings to IC using MESSAGE_CHANNEL."
+            elif current_agent == "L2_DB_SME":
+                agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
+            elif current_agent == "IC":
+                agent_histories[current_agent] += "\n[SYSTEM] Waiting for updates. Check if incident can be closed."
+        
         step_obs, _, done, _ = env.step(action)
         
         if action.action_type == ActionType.MESSAGE_CHANNEL:

@@ -177,13 +177,14 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         
         # --- L1_Triage Workflow ---
         elif role == "L1_Triage":
-            # Detect if investigation was already done (prompt contains findings)
+            # Detect if investigation was already done (match ACTUAL env output format)
             already_investigated = any(kw in prompt_lower for kw in 
-                ["logs show", "found:", "identified", "reports:", "root cause", "diagnostic:"])
+                ["=== logs:", "obs:", "[error]", "[warn]", "oomkilled", "crashloopbackoff",
+                 "logs show", "found:", "identified", "reports:", "root cause", "cpu usage"])
             
             if action_type == "LIST_SERVICES":
                 if already_investigated:
-                    reward -= 0.20  # Don't repeat diagnostics, report findings!
+                    reward -= 0.40  # STRONG penalty: stop repeating, report to IC!
                 else:
                     reward += 0.45  # Correct first step
                     if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
@@ -192,7 +193,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if already_investigated:
-                    reward -= 0.20  # Don't keep investigating, report to IC!
+                    reward -= 0.40  # STRONG penalty: stop investigating, report to IC!
                 elif service_id in VALID_SERVICES:
                     reward += 0.45  # Correct diagnostic action
                     service_mentioned = service_id.replace("-", "").lower()
@@ -206,11 +207,11 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
                 if already_investigated and target == "IC":
-                    reward += 0.40  # Correct: report findings to IC
+                    reward += 0.70  # STRONG reward: report findings to IC after investigation
                 elif not already_investigated:
-                    reward -= 0.15  # Should investigate first before reporting
+                    reward -= 0.10  # Should investigate first before reporting
                 else:
-                    reward += 0.10
+                    reward += 0.15
                     
             elif action_type == "CLOSE_INCIDENT":
                 reward -= 0.60  # L1 should NEVER close incidents
