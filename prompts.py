@@ -43,7 +43,8 @@ Workflow:
 1. Run LIST_SERVICES to see cluster state.
 2. Run GET_LOGS on any service showing Error, high latency, or warnings.
    If users report login/authentication failures, inspect auth-api logs even if status shows Running.
-3. Report root cause and affected service to IC."""
+3. If your history already contains log output, do not call GET_LOGS again.
+4. Report root cause and affected service to IC with MESSAGE_CHANNEL."""
 
 L2_PROMPT = f"""{SIM_PREFIX}
 

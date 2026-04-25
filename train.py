@@ -597,6 +597,65 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
     return trajectories
 
 
+def generate_transition_focus_prompts(num_samples: int = 80):
+    """High-value states where the model must stop repeating and move workflow forward."""
+    focused = [
+        (
+            "L1_Triage",
+            "New message from IC: Investigate login failures in the authentication flow.\n"
+            "Obs: === Logs: auth-api ===\n"
+            "[ERROR] TLS handshake failed: certificate has expired\n"
+            "[WARN] Upstream certificate expired 2 days ago\n"
+            "You already have auth-api logs. Report the RCA to IC now.",
+        ),
+        (
+            "L1_Triage",
+            "New message from IC: Investigate payment-db Error.\n"
+            "Obs: === Logs: payment-db ===\n"
+            "[ERROR] OOMKilled\n"
+            "[ERROR] CrashLoopBackOff\n"
+            "You already have payment-db logs. Report root cause to IC now.",
+        ),
+        (
+            "L1_Triage",
+            "New message from IC: Investigate high latency on auth-api.\n"
+            "Obs: === Logs: auth-api ===\n"
+            "[WARN] RPS=3500 - CPU usage 99.8%\n"
+            "You already have auth-api logs. Report root cause to IC now.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Restart payment-db to recover from CrashLoopBackOff.\n"
+            "Obs: [OK] payment-db restarted by L2_DB_SME.\n"
+            "Fix already applied. Report completion to IC now.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Scale auth-api to 2048 CPU to resolve latency.\n"
+            "Obs: [OK] auth-api scaled to 2048m CPU.\n"
+            "Fix already applied. Report completion to IC now.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\n"
+            "New message from L1_Triage: Root cause is payment-db CrashLoopBackOff/OOMKilled.\n"
+            "New message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\n"
+            "New message from L1_Triage: Root cause is auth-api CPU saturation.\n"
+            "New message from L2_DB_SME: Fix applied. auth-api scaled to 2048 CPU. Latency resolved.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.\n"
+            "New message from L1_Triage: Root cause is expired upstream TLS certificate on auth-api. No local fix available.",
+        ),
+    ]
+    return [focused[i % len(focused)] for i in range(num_samples)]
+
+
 def build_dataset(num_samples: int = 800):
     """
     Builds a diverse dataset combining:
@@ -608,8 +667,9 @@ def build_dataset(num_samples: int = 800):
     
     roles = list(PROMPTS.keys())
     
-    # Part 1: Static scenario messages (50% of dataset)
-    static_samples = int(num_samples * 0.5)
+    # Part 1: Static scenario messages (45% of dataset)
+    focus_samples = int(num_samples * 0.10)
+    static_samples = int(num_samples * 0.45)
     for _ in range(static_samples):
         role_key = roles[torch.randint(0, len(roles), (1,)).item()]
         messages_for_role = SCENARIO_MESSAGES[role_key]
@@ -627,8 +687,8 @@ def build_dataset(num_samples: int = 800):
         )
         prompts_list.append(prompt_str)
     
-    # Part 2: Synthetic trajectories (50% of dataset)
-    trajectory_samples = num_samples - static_samples
+    # Part 2: Synthetic trajectories (45% of dataset)
+    trajectory_samples = num_samples - static_samples - focus_samples
     num_episodes = max(1, (trajectory_samples + 5) // 6)  # Generate enough turns, then slice to target.
     trajectories = generate_synthetic_trajectories(num_episodes)
     
@@ -645,11 +705,29 @@ def build_dataset(num_samples: int = 800):
             add_generation_prompt=True
         )
         prompts_list.append(prompt_str)
+
+    # Part 3: Focused transition prompts (10% of dataset)
+    focus_prompts = generate_transition_focus_prompts(focus_samples)
+    for role_key, user_msg in focus_prompts:
+        messages = [
+            {"role": "system", "content": PROMPTS[role_key]},
+            {"role": "user", "content": user_msg}
+        ]
+
+        prompt_str = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        prompts_list.append(prompt_str)
     
     # Shuffle to mix static and trajectory samples
     random.shuffle(prompts_list)
     
-    logger.info(f"Built dataset with {len(prompts_list)} examples ({static_samples} static + {len(selected_trajectories)} trajectory)")
+    logger.info(
+        f"Built dataset with {len(prompts_list)} examples "
+        f"({static_samples} static + {len(selected_trajectories)} trajectory + {len(focus_prompts)} transition-focus)"
+    )
     return Dataset.from_dict({"prompt": prompts_list})
 
 # ---------------------------------------------------------------------------
