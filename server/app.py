@@ -23,6 +23,7 @@ class ActionType(str, Enum):
     RESTART = "RESTART"
     SCALE = "SCALE"
     UPDATE_CONFIG = "UPDATE_CONFIG"
+    REPAIR_REPLICA = "REPAIR_REPLICA"
     MESSAGE_CHANNEL = "MESSAGE_CHANNEL"
     CLOSE_INCIDENT = "CLOSE_INCIDENT"
     INVALID_FORMAT = "INVALID_FORMAT" # NEW: For RL Syntax Penalties
@@ -45,6 +46,7 @@ class ServiceMetrics(BaseModel):
     memory_allocated: int
     latency_ms: int
     memory_limit_mb: Optional[int] = None
+    cache_epoch: Optional[int] = None
 
 class Observation(BaseModel):
     text_output: str
@@ -69,13 +71,14 @@ class Service:
         self.latency_ms = lat
         self.logs: List[str] = []
         self.error_message: str = ""
+        self.cache_epoch: Optional[int] = None
 
     @property
     def metrics(self) -> ServiceMetrics:
         return ServiceMetrics(
             id=self.id, status=self.status, cpu_allocated=self.cpu_allocated,
             memory_allocated=self.memory_allocated, latency_ms=self.latency_ms,
-            memory_limit_mb=self.memory_limit_mb
+            memory_limit_mb=self.memory_limit_mb, cache_epoch=self.cache_epoch
         )
 
 class MockCloud:
@@ -107,6 +110,8 @@ class MockCloud:
             self._apply_tls_certificate_expiry()
         elif scenario == "resource_contention":
             self._apply_resource_contention()
+        elif scenario == "split_brain_cache":
+            self._apply_split_brain_cache()
 
         self._propagate_failures()
 
@@ -153,6 +158,68 @@ class MockCloud:
             "[INFO] Database CPU is normal; memory reclaim stalls detected"
         ]
         self.incident_channel.append("[SYSTEM ALERT] Checkout latency detected on payment-db.")
+
+    def _apply_split_brain_cache(self):
+        self.services["checkout-api"] = Service("checkout-api", lat=420)
+        self.services["session-cache-primary"] = Service("session-cache-primary", mem=1024, lat=20)
+        self.services["session-cache-replica"] = Service("session-cache-replica", mem=1024, lat=25)
+
+        checkout = self.services["checkout-api"]
+        checkout.logs = [
+            "[ERROR] cart_total_mismatch user=user_123 expected=100 observed=80",
+            "[WARN] intermittent session lookup mismatch from cache pool"
+        ]
+        checkout.error_message = "Warning: inconsistent cart/session data returned by cache layer."
+
+        auth = self.services["auth-api"]
+        auth.latency_ms = 120
+        auth.logs = [
+            "[WARN] session token validation intermittently failed",
+            "[INFO] auth-api CPU and upstream DB checks normal"
+        ]
+
+        primary = self.services["session-cache-primary"]
+        primary.cache_epoch = 1842
+        primary.logs = [
+            "[INFO] role=primary cache_epoch=1842 writes_enabled=true",
+            "[INFO] cart:user_123 total=100 version=91"
+        ]
+
+        replica = self.services["session-cache-replica"]
+        replica.cache_epoch = 1837
+        replica.logs = [
+            "[WARN] role=replica cache_epoch=1837 serving_traffic=true",
+            "[WARN] replication_lag=5 epochs; cart:user_123 total=80 version=86",
+            "[ERROR] split-brain suspected after network partition"
+        ]
+
+        self.incident_channel.append("[SYSTEM ALERT] Intermittent checkout cart mismatches and session failures detected.")
+
+    def repair_cache_replica(self, service_id: str) -> bool:
+        if service_id != "session-cache-replica":
+            return False
+
+        primary = self.services.get("session-cache-primary")
+        replica = self.services.get("session-cache-replica")
+        checkout = self.services.get("checkout-api")
+        auth = self.services.get("auth-api")
+        if not primary or not replica:
+            return False
+
+        replica.cache_epoch = primary.cache_epoch
+        replica.latency_ms = 20
+        replica.logs = [
+            f"[INFO] Replica resynced to cache_epoch={primary.cache_epoch}",
+            "[INFO] Split-brain repaired; serving consistent cache data"
+        ]
+        if checkout:
+            checkout.latency_ms = 45
+            checkout.error_message = ""
+            checkout.logs = ["[INFO] Cart totals consistent after cache replica repair."]
+        if auth:
+            auth.latency_ms = 45
+            auth.logs = ["[INFO] Session validation stable after cache repair."]
+        return True
 
     def _has_worker_memory_pressure(self) -> bool:
         worker = self.services.get("notification-worker")
@@ -233,6 +300,8 @@ class CloudSREEnv:
             self.cloud.reset(scenario="performance_bottleneck")
         elif "task4" in self.current_task:
             self.cloud.reset(scenario="resource_contention")
+        elif "task5" in self.current_task:
+            self.cloud.reset(scenario="split_brain_cache")
         else:
             self.cloud.reset(scenario=scenario or "healthy")
 
@@ -283,6 +352,7 @@ class CloudSREEnv:
             lines = [
                 f"{svc.id:<20} {svc.status:<10} CPU={svc.cpu_allocated}m "
                 f"MEM={svc.memory_allocated}MB LAT={svc.latency_ms}ms"
+                + (f" EPOCH={svc.cache_epoch}" if svc.cache_epoch is not None else "")
                 for svc in self.cloud.services.values()
             ]
             obs_text = "\n".join(lines)
@@ -327,6 +397,11 @@ class CloudSREEnv:
                         breakdown["wrong_root_cause_penalty"] = -0.4
                         obs_text += " [WARN] Latency persists; DB was not the root cause."
 
+                    if "task5" in self.current_task and action.service_id == "checkout-api":
+                        total_reward -= 0.4
+                        breakdown["wrong_root_cause_penalty"] = -0.4
+                        obs_text += " [WARN] Mismatches persist; checkout-api was only the symptom."
+
         elif action.action_type == ActionType.UPDATE_CONFIG:
             if action.memory_limit_mb is None:
                 obs_text = "[ERROR] UPDATE_CONFIG requires memory_limit_mb parameter."
@@ -344,6 +419,15 @@ class CloudSREEnv:
                     else:
                         self.cloud._propagate_failures()
                     obs_text = f"[OK] {action.service_id} memory limit set to {action.memory_limit_mb}MB."
+
+        elif action.action_type == ActionType.REPAIR_REPLICA:
+            repaired = self.cloud.repair_cache_replica(action.service_id or "")
+            if repaired:
+                obs_text = f"[OK] {action.service_id} resynced to primary cache epoch."
+            else:
+                obs_text = f"[ERROR] {action.service_id} is not a repairable cache replica."
+                total_reward -= 0.2
+                breakdown["wrong_repair_target_penalty"] = -0.2
 
         elif action.action_type == ActionType.MESSAGE_CHANNEL:
             msg = f"[{action.agent_id} -> {action.target}]: {action.message}"
@@ -374,6 +458,7 @@ class CloudSREEnv:
         - GET_LOGS / RESTART: (type, agent, service)
         - SCALE: (type, agent, service, cpu_value)  -- different cpu_value is allowed
         - UPDATE_CONFIG: (type, agent, service, memory_limit_mb)
+        - REPAIR_REPLICA: (type, agent, service)
         - MESSAGE_CHANNEL: (type, agent, target)    -- message text intentionally ignored
         """
         if action.action_type == ActionType.SCALE:
@@ -382,7 +467,7 @@ class CloudSREEnv:
             return (action.action_type, action.agent_id, action.service_id, action.memory_limit_mb)
         if action.action_type == ActionType.MESSAGE_CHANNEL:
             return (action.action_type, action.agent_id, action.target)
-        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART):
+        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART, ActionType.REPAIR_REPLICA):
             return (action.action_type, action.agent_id, action.service_id)
         return (action.action_type, action.agent_id)
 
@@ -420,7 +505,7 @@ class CloudSREEnv:
             reason = "Communicated in channel."
 
         # 3. RBAC Rubric (Strictly enforce roles)
-        if action.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG]:
+        if action.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG, ActionType.REPAIR_REPLICA]:
             if action.agent_id != "L2_DB_SME":
                 return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
             else:
@@ -447,6 +532,29 @@ class CloudSREEnv:
                 breakdown["db_scaling_trap"] = -0.35
                 reason = "Scaled symptom service instead of noisy neighbor."
 
+        if "task5" in self.current_task:
+            checked_primary = any(a.action_type == ActionType.GET_LOGS and a.service_id == "session-cache-primary" for a in self.action_history)
+            checked_replica = any(a.action_type == ActionType.GET_LOGS and a.service_id == "session-cache-replica" for a in self.action_history)
+            if action.action_type == ActionType.GET_LOGS and action.service_id == "checkout-api":
+                reward += 0.1
+                breakdown["symptom_trace"] = 0.1
+                reason = "Inspected checkout symptom logs."
+            elif action.action_type == ActionType.GET_LOGS and action.service_id in ("session-cache-primary", "session-cache-replica"):
+                reward += 0.15
+                breakdown["cache_epoch_discovery"] = 0.15
+                if checked_primary and checked_replica:
+                    reward += 0.2
+                    breakdown["split_brain_evidence"] = 0.2
+                reason = "Inspected cache consistency evidence."
+            elif action.action_type == ActionType.REPAIR_REPLICA and action.service_id == "session-cache-replica":
+                reward += 0.5
+                breakdown["correct_replica_repair"] = 0.5
+                reason = "Repaired split-brain cache replica."
+            elif action.action_type in (ActionType.RESTART, ActionType.SCALE) and action.service_id == "checkout-api":
+                reward -= 0.4
+                breakdown["checkout_symptom_trap"] = -0.4
+                reason = "Remediated symptom service instead of cache split-brain."
+
         # 4. Time Penalty (Encourages efficiency)
         time_penalty = -0.02 * self.steps_taken
         reward += time_penalty
@@ -461,7 +569,7 @@ class CloudSREEnv:
             # TLS Certificate RCA: GET_LOGS(auth-api) happened AND no RESTART/SCALE
             found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api" for a in self.action_history)
             no_remediation = not any(
-                a.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG]
+                a.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG, ActionType.REPAIR_REPLICA]
                 for a in self.action_history
             )
             return (True, 0.8) if (found_logs and no_remediation) else (False, 0.0)
@@ -484,6 +592,22 @@ class CloudSREEnv:
                 for a in self.action_history
             )
             return (True, 1.0) if config_applied and db.latency_ms < 100 and worker.memory_allocated <= 2048 else (False, 0.0)
+
+        elif "task5" in self.current_task:
+            primary = self.cloud.services.get("session-cache-primary")
+            replica = self.cloud.services.get("session-cache-replica")
+            checkout = self.cloud.services.get("checkout-api")
+            checked_both_caches = all(
+                any(a.action_type == ActionType.GET_LOGS and a.service_id == svc for a in self.action_history)
+                for svc in ("session-cache-primary", "session-cache-replica")
+            )
+            repaired_replica = any(
+                a.action_type == ActionType.REPAIR_REPLICA and a.service_id == "session-cache-replica"
+                for a in self.action_history
+            )
+            epochs_match = bool(primary and replica and primary.cache_epoch == replica.cache_epoch)
+            checkout_recovered = bool(checkout and checkout.latency_ms < 100)
+            return (True, 1.0) if checked_both_caches and repaired_replica and epochs_match and checkout_recovered else (False, 0.0)
             
         return False, 0.0
 

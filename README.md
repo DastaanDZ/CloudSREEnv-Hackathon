@@ -56,6 +56,7 @@ Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue a
 | **Self-Healing** | Medium | DB Recovery | Restore DB health to fix entire cluster |
 | **RCA & Scaling** | Hard | Latency Bottleneck | Scale the DB (root cause) to fix worker latency |
 | **Noisy Neighbor** | Hard | Resource Contention | Limit notification-worker memory to restore payment-db latency |
+| **Split-Brain Cache** | Expert | Cache Consistency | Repair stale session-cache-replica after detecting divergent cache epochs |
 
 ---
 
@@ -67,6 +68,7 @@ Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue a
 - `RESTART(service_id)`: Restores a crashed pod.
 - `SCALE(service_id, cpu_value)`: Modifies CPU (Success: `cpu >= 2048`).
 - `UPDATE_CONFIG(service_id, memory_limit_mb)`: Applies a memory limit to a service (Task 4 success: `notification-worker <= 2048MB`).
+- `REPAIR_REPLICA(service_id)`: Resyncs a stale cache replica after split-brain (Task 5 success: repair `session-cache-replica`).
 
 ### Observation Space (Outputs)
 - `text_output`: Human-readable terminal logs and status tables.

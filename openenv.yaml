@@ -61,12 +61,29 @@ tasks:
     max_steps: 20
     scenario: resource_contention
 
+  - id: task5_split_brain_cache_consistency
+    name: "Split-Brain Cache Consistency"
+    difficulty: expert
+    description: >
+      Diagnose intermittent checkout cart mismatches and session failures caused
+      by a split-brain cache cluster. The agent must avoid restarting checkout-api,
+      compare session-cache-primary and session-cache-replica cache epochs, and
+      repair the stale replica.
+    success_criteria: >
+      Final score 1.00: Agent inspects both cache nodes, detects divergent
+      cache_epoch values, applies REPAIR_REPLICA to session-cache-replica, and
+      restores checkout consistency.
+    max_steps: 20
+    scenario: split_brain_cache
+
 reward_shaping:
   useful_diagnostic: +0.1
   hallucinated_service: -0.2
   unnecessary_restart: -0.5
   wrong_root_cause_scale: -0.35 # Discourages scaling payment-db in task4
   config_fix_bonus: +0.45      # Rewards constraining noisy-neighbor memory
+  split_brain_evidence: +0.2   # Rewards checking both cache epochs in task5
+  replica_repair_bonus: +0.5   # Rewards repairing session-cache-replica
   step_penalty: -0.02         # Encourages resolution speed
   cost_penalty: -0.1          # Discourages over-provisioning (>4000m CPU)
   task_completion_bonus: +0.9 # Final non-binary success signal

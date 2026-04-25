@@ -52,8 +52,16 @@ def seed_everything(seed: int = SEED) -> None:
         torch.cuda.manual_seed_all(seed)
 
 # Valid services in the environment (for semantic scoring)
-VALID_SERVICES = {"auth-api", "payment-db", "inventory-svc", "notification-worker"}
-VALID_ACTIONS = {"LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG", "MESSAGE_CHANNEL", "CLOSE_INCIDENT"}
+VALID_SERVICES = {
+    "auth-api",
+    "payment-db",
+    "inventory-svc",
+    "notification-worker",
+    "checkout-api",
+    "session-cache-primary",
+    "session-cache-replica",
+}
+VALID_ACTIONS = {"LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG", "REPAIR_REPLICA", "MESSAGE_CHANNEL", "CLOSE_INCIDENT"}
 VALID_TARGETS = {"IC", "L1_Triage", "L2_DB_SME"}
 
 # ---------------------------------------------------------------------------
@@ -180,7 +188,12 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             and "notification-worker" in prompt_lower
             and any(kw in prompt_lower for kw in ["8000mb", "memory pressure", "noisy neighbor", "starving", "memory limit"])
         )
-        has_fixable_l1_evidence = task2_crash_evidence or task3_perf_evidence or task4_contention_evidence
+        task5_split_brain_evidence = (
+            has_l1_message
+            and "session-cache-replica" in prompt_lower
+            and any(kw in prompt_lower for kw in ["cache_epoch", "split-brain", "divergent", "repair"])
+        )
+        has_fixable_l1_evidence = task2_crash_evidence or task3_perf_evidence or task4_contention_evidence or task5_split_brain_evidence
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
         is_after_investigation = (
             any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
@@ -190,7 +203,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         is_after_fix = any(kw in prompt_lower for kw in [
             "l2_db_sme confirms", "l2_db_sme reports", "new message from l2_db_sme",
             "all services now healthy", "fix successfully", "fix applied",
-            "restarted and is now", "restarted.", "scaled to", "memory limit set", "update_config"
+            "restarted and is now", "restarted.", "scaled to", "memory limit set", "update_config",
+            "repaired", "resynced", "repair_replica"
         ])
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
@@ -251,7 +265,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 else:
                     manual_reward -= 0.30
                     
-            elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG"]:
+            elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG", "REPAIR_REPLICA"]:
                 manual_reward -= 0.30
         
         # --- L1_Triage Workflow ---
@@ -262,7 +276,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             has_service_list = any(kw in prompt_lower for kw in ["running", "error      0ms", "obs:"])
             has_log_content = any(kw in prompt_lower for kw in 
                 ["=== logs:", "[error]", "[warn]", "oomkilled", "crashloopbackoff",
-                 "cpu usage", "rps=", "503 service unavailable", "8000mb", "memory pressure"])
+                 "cpu usage", "rps=", "503 service unavailable", "8000mb", "memory pressure",
+                 "cart_total_mismatch", "cache_epoch", "split-brain"])
             has_reported = any(kw in prompt_lower for kw in 
                 ["found:", "identified", "reports:", "root cause", "report findings"])
             is_login_context = any(kw in prompt_lower for kw in ["login failure", "authentication failure", "authentication flow"])
@@ -273,6 +288,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             is_checkout_latency_context = "checkout latency" in prompt_lower or (
                 "payment-db" in prompt_lower and "latency" in prompt_lower
             )
+            is_split_brain_context = any(kw in prompt_lower for kw in [
+                "cart total mismatch", "cart_total_mismatch", "session-cache", "cache_epoch", "split-brain"
+            ])
             
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
@@ -287,6 +305,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         manual_reward += 0.15
                     if is_checkout_latency_context:
                         manual_reward += 0.25
+                    if is_split_brain_context:
+                        manual_reward += 0.25
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
@@ -296,6 +316,10 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     manual_reward -= 0.55
                 elif is_resource_contention_context and service_id == "payment-db":
                     manual_reward -= 0.65
+                elif is_split_brain_context and service_id == "checkout-api":
+                    manual_reward += 0.35
+                elif is_split_brain_context and service_id in {"session-cache-primary", "session-cache-replica"}:
+                    manual_reward += 0.65
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
@@ -313,6 +337,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 target = action_dict.get("target", "")
                 if is_checkout_latency_context and not is_resource_contention_context:
                     manual_reward -= 0.65
+                elif is_split_brain_context and "session-cache-primary" not in prompt_lower and "session-cache-replica" not in prompt_lower:
+                    manual_reward -= 0.55
                 elif has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
                     manual_reward += 0.85
@@ -328,7 +354,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "CLOSE_INCIDENT":
                 manual_reward -= 0.60
                 
-            elif action_type in ["RESTART", "SCALE", "UPDATE_CONFIG"]:
+            elif action_type in ["RESTART", "SCALE", "UPDATE_CONFIG", "REPAIR_REPLICA"]:
                 manual_reward -= 0.50
         
         # --- L2_DB_SME Workflow ---
@@ -339,12 +365,18 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 "notification-worker" in prompt_lower
                 and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db"])
             )
+            is_split_brain_context = (
+                "session-cache-replica" in prompt_lower
+                and any(kw in prompt_lower for kw in ["cache_epoch", "split-brain", "divergent", "repair", "resync"])
+            )
             
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
                     manual_reward -= 0.25
                 elif service_id in VALID_SERVICES:
+                    if is_split_brain_context and service_id == "checkout-api":
+                        manual_reward -= 0.65
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
                         manual_reward += 0.20
@@ -362,6 +394,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if fix_already_applied:
                     manual_reward -= 0.25
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
+                    if is_split_brain_context and service_id == "checkout-api":
+                        manual_reward -= 0.65
                     if is_resource_contention_context and service_id == "payment-db":
                         manual_reward -= 0.60
                     if cpu_value >= 2048:
@@ -398,6 +432,19 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     manual_reward -= 0.25
                 else:
                     manual_reward -= 0.30
+
+            elif action_type == "REPAIR_REPLICA":
+                service_id = action_dict.get("service_id", "")
+                if fix_already_applied:
+                    manual_reward -= 0.25
+                elif service_id == "session-cache-replica":
+                    manual_reward += 0.85
+                    if is_split_brain_context:
+                        manual_reward += 0.35
+                elif service_id in VALID_SERVICES:
+                    manual_reward -= 0.40
+                else:
+                    manual_reward -= 0.30
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
@@ -417,7 +464,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # =====================================================================
         # STAGE 7: Field completeness validation (manual)
         # =====================================================================
-        if action_type in ["GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG"]:
+        if action_type in ["GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG", "REPAIR_REPLICA"]:
             if not action_dict.get("service_id"):
                 manual_reward -= 0.15
                 
@@ -449,6 +496,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 env.reset(task_id="task2_self_healing")
             elif any(kw in prompt_lower for kw in ["notification-worker", "8000mb", "noisy neighbor", "memory pressure", "memory limit", "checkout latency"]):
                 env.reset(task_id="task4_resource_contention")
+            elif any(kw in prompt_lower for kw in ["checkout cart", "cart_total_mismatch", "session-cache", "cache_epoch", "split-brain", "repair_replica"]):
+                env.reset(task_id="task5_split_brain_cache_consistency")
             elif "latency" in prompt_lower or "slow" in prompt_lower or "cpu" in prompt_lower:
                 env.reset(task_id="task3_latency_resolution")
             else:
@@ -515,7 +564,7 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             pass
 
     # Replay LIST_SERVICES if prompt contains service listing output
-    if any(svc in prompt_lower for svc in ["auth-api", "payment-db", "inventory-svc"]) and "running" in prompt_lower:
+    if any(svc in prompt_lower for svc in ["auth-api", "payment-db", "inventory-svc", "checkout-api", "session-cache"]) and "running" in prompt_lower:
         replay_once(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
     
     # Replay GET_LOGS if prompt contains actual log output (=== Logs: <svc> ===)
@@ -526,6 +575,12 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
         if "=== logs: notification-worker ===" in prompt_lower or "notification-worker" in prompt_lower and "8000mb" in prompt_lower:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="notification-worker"))
+        if "=== logs: checkout-api ===" in prompt_lower or "cart_total_mismatch" in prompt_lower:
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="checkout-api"))
+        if "=== logs: session-cache-primary ===" in prompt_lower:
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-primary"))
+        if "=== logs: session-cache-replica ===" in prompt_lower or "split-brain" in prompt_lower:
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-replica"))
     
     # IC prompts often contain L1 summaries rather than raw logs. Replay the
     # implied read-only evidence so IC routing actions get accurate env scores.
@@ -536,6 +591,9 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
         if "notification-worker" in prompt_lower and any(kw in prompt_lower for kw in ["8000mb", "memory pressure", "noisy neighbor", "starving"]):
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="notification-worker"))
+        if "session-cache-replica" in prompt_lower and any(kw in prompt_lower for kw in ["cache_epoch", "split-brain", "divergent", "repair"]):
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-primary"))
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-replica"))
     
     # IC only sees L1's RCA report, not the raw L1 action history. Recreate the
     # required task1 evidence so CLOSE_INCIDENT is scored like inference.
@@ -566,6 +624,15 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
                 memory_limit_mb=2048,
             ))
 
+    # Replay REPAIR_REPLICA if prompt says the cache replica was resynced.
+    if "repaired" in prompt_lower or "resynced" in prompt_lower or "repair_replica" in prompt_lower:
+        if "session-cache-replica" in prompt_lower:
+            replay_once(Action(
+                action_type=ActionType.REPAIR_REPLICA,
+                agent_id="L2_DB_SME",
+                service_id="session-cache-replica",
+            ))
+
 
 def _detect_role_from_prompt(prompt_str: str) -> str:
     """Extract the agent role from the prompt string."""
@@ -592,6 +659,7 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         "task2_self_healing",
         "task3_latency_resolution",
         "task4_resource_contention",
+        "task5_split_brain_cache_consistency",
     ]
     for episode_idx in range(num_episodes):
         env = CloudSREEnv()
@@ -624,10 +692,18 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             target_svc = "payment-db"
         elif "task4" in task:
             target_svc = "notification-worker"
+        elif "task5" in task:
+            target_svc = "session-cache-replica"
         else:
             target_svc = "auth-api"
-        log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
-        agent_histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
+        if "task5" in task:
+            checkout_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="checkout-api"))
+            primary_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-primary"))
+            replica_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-replica"))
+            agent_histories["L1_Triage"] += f"\nObs: {checkout_obs.text_output}\nObs: {primary_obs.text_output}\nObs: {replica_obs.text_output}"
+        else:
+            log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
+            agent_histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
         
         # Turn 4: L1 reports to IC (should MESSAGE_CHANNEL)
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
@@ -644,6 +720,8 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
                 finding = "Root cause: payment-db is in CrashLoopBackOff with OOMKilled errors. It needs RESTART."
             elif "task4" in task:
                 finding = "Root cause: notification-worker is using 8000MB RAM and starving payment-db. It needs UPDATE_CONFIG memory_limit_mb 2048."
+            elif "task5" in task:
+                finding = "Root cause: session-cache split-brain. primary cache_epoch=1842 but replica cache_epoch=1837. It needs REPAIR_REPLICA on session-cache-replica."
             else:
                 finding = "Root cause: auth-api CPU is saturated under high RPS, causing latency. It needs SCALE to 2048 CPU."
             agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
@@ -654,6 +732,8 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
                 agent_histories["L2_DB_SME"] = "New message from IC: Restart payment-db to recover from CrashLoopBackOff."
             elif "task4" in task:
                 agent_histories["L2_DB_SME"] = "New message from IC: Set notification-worker memory limit to 2048MB to stop starving payment-db."
+            elif "task5" in task:
+                agent_histories["L2_DB_SME"] = "New message from IC: Repair session-cache-replica to resync divergent cache epochs."
             else:
                 agent_histories["L2_DB_SME"] = "New message from IC: Scale auth-api to 2048 CPU to resolve latency."
             
@@ -670,6 +750,13 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
                     memory_limit_mb=2048,
                 ))
                 fix_msg = f"{target_svc} memory limit set to 2048MB."
+            elif "task5" in task:
+                fix_obs, _, _, _ = env.step(Action(
+                    action_type=ActionType.REPAIR_REPLICA,
+                    agent_id="L2_DB_SME",
+                    service_id=target_svc,
+                ))
+                fix_msg = f"{target_svc} repaired and resynced."
             else:
                 fix_obs, _, _, _ = env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
                 fix_msg = f"{target_svc} restarted."

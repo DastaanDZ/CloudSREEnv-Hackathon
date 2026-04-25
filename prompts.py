@@ -16,14 +16,14 @@ Available Actions:
 - {{"action_type": "MESSAGE_CHANNEL", "target": "L1_Triage", "message": "<instruction>"}}
   Delegate investigation to L1_Triage.
 - {{"action_type": "MESSAGE_CHANNEL", "target": "L2_DB_SME", "message": "<instruction>"}}
-  Delegate fixes to L2_DB_SME only for remediable crash, scaling, or config issues.
+  Delegate fixes to L2_DB_SME only for remediable crash, scaling, config, or replica-repair issues.
 - {{"action_type": "CLOSE_INCIDENT"}}
   Close the incident once all issues are resolved.
 
 Workflow:
 1. On initial alert, delegate investigation to L1_Triage.
 2. When L1_Triage reports root cause:
-   - If the issue requires remediation (crash, scaling, config), delegate the fix to L2_DB_SME.
+   - If the issue requires remediation (crash, scaling, config, replica repair), delegate the fix to L2_DB_SME.
    - If the issue is external or non-remediable (e.g., expired certificate), close the incident after documenting the RCA.
 3. When L2_DB_SME confirms fix applied, close the incident."""
 
@@ -44,6 +44,7 @@ Workflow:
 2. Run GET_LOGS on any service showing Error, high latency, or warnings.
    If users report login/authentication failures, inspect auth-api logs even if status shows Running.
    If payment-db is slow but another service has extreme memory usage, report that noisy neighbor as root cause.
+   If checkout has intermittent cart/session mismatches, compare session-cache-primary and session-cache-replica logs for divergent cache epochs.
 3. Report root cause and affected service to IC."""
 
 L2_PROMPT = f"""{SIM_PREFIX}
@@ -57,6 +58,8 @@ Available Actions:
   Scale CPU allocation (use 2048 or higher to resolve performance issues).
 - {{"action_type": "UPDATE_CONFIG", "service_id": "<service_name>", "memory_limit_mb": <int>}}
   Apply a strict memory limit to a noisy neighbor service.
+- {{"action_type": "REPAIR_REPLICA", "service_id": "<service_name>"}}
+  Resync a stale cache replica after split-brain.
 - {{"action_type": "MESSAGE_CHANNEL", "target": "IC", "message": "<status>"}}
   Report fix status back to the Incident Commander.
 
@@ -64,7 +67,8 @@ Workflow:
 1. If service is in Error/CrashLoop: use RESTART.
 2. If service has high CPU/latency: use SCALE with cpu_value >= 2048.
 3. If a low-priority worker is hogging node memory: use UPDATE_CONFIG on that worker with memory_limit_mb <= 2048.
-4. After applying fix, message IC to confirm completion."""
+4. If a cache replica has divergent cache_epoch after split-brain: use REPAIR_REPLICA on the replica.
+5. After applying fix, message IC to confirm completion."""
 
 PROMPTS = {
     "IC": IC_PROMPT,
@@ -100,6 +104,12 @@ SCENARIO_MESSAGES = {
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\nNew message from L1_Triage: Root cause found. notification-worker is using 8000MB RAM and starving payment-db.",
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\nNew message from L1_Triage: payment-db is throttled by node memory pressure from notification-worker. Apply a strict memory limit to notification-worker.",
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency.\nNew message from L1_Triage: notification-worker is the noisy neighbor at 8000MB RAM.\nNew message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+
+        # Task5: cache split-brain (needs REPAIR_REPLICA)
+        "INITIAL ALERT:\n[SYSTEM ALERT] Intermittent checkout cart mismatches and session failures detected.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Checkout cart mismatch.\nNew message from L1_Triage: session-cache-primary is at cache_epoch 1842 but session-cache-replica is stuck at 1837. Root cause is cache split-brain.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Checkout cart mismatch.\nNew message from L1_Triage: checkout-api is only the symptom. session-cache-replica has divergent cache_epoch and must be repaired.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Cart mismatches.\nNew message from L1_Triage: Cache split-brain found between primary and replica.\nNew message from L2_DB_SME: Fix applied. session-cache-replica repaired and cache epochs now match.",
     ],
     "L1_Triage": [
         # Initial investigation prompts
@@ -107,6 +117,7 @@ SCENARIO_MESSAGES = {
         "New message from IC: Users reporting login failures. Investigate the authentication flow.",
         "New message from IC: Users reporting errors. Investigate and report back.",
         "New message from IC: Checkout latency on payment-db. First run LIST_SERVICES and look for noisy neighbors before checking DB logs.",
+        "New message from IC: Intermittent checkout cart total mismatch and session failures. Inspect checkout-api, then compare both session cache nodes.",
         
         # Task1: After LIST_SERVICES with login context - auth-api shows high latency, should GET_LOGS(auth-api)
         "New message from IC: Investigate login failures in the authentication flow.\nObs: auth-api              Running    350ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",
@@ -128,12 +139,18 @@ SCENARIO_MESSAGES = {
         # Task4: Noisy neighbor memory contention
         "New message from IC: Checkout latency on payment-db. Investigate all services.\nObs: auth-api              Running    CPU=1024m MEM=2048MB LAT=370ms\npayment-db            Running    CPU=2048m MEM=4096MB LAT=650ms\ninventory-svc         Running    CPU=1024m MEM=2048MB LAT=370ms\nnotification-worker   Running    CPU=1024m MEM=8000MB LAT=180ms",
         "New message from IC: payment-db is slow but CPU looks normal.\nObs: === Logs: notification-worker ===\n[WARN] Heap growth detected: notification batch cache at 8000MB\n[WARN] Node memory pressure: worker has no memory limit",
+
+        # Task5: Split-brain cache evidence
+        "New message from IC: Investigate checkout cart mismatches.\nObs: === Logs: checkout-api ===\n[ERROR] cart_total_mismatch user=user_123 expected=100 observed=80\n[WARN] intermittent session lookup mismatch from cache pool",
+        "New message from IC: Compare cache nodes.\nObs: === Logs: session-cache-primary ===\n[INFO] role=primary cache_epoch=1842 writes_enabled=true\n[INFO] cart:user_123 total=100 version=91",
+        "New message from IC: Compare cache nodes.\nObs: === Logs: session-cache-replica ===\n[WARN] role=replica cache_epoch=1837 serving_traffic=true\n[WARN] replication_lag=5 epochs; cart:user_123 total=80 version=86\n[ERROR] split-brain suspected after network partition",
         
         # Explicit "you have logs, now report" scenarios
         "New message from IC: What did you find?\nObs: === Logs: auth-api ===\n[ERROR] TLS handshake failed: certificate has expired\n[SYSTEM] Certificate issue identified. Report to IC.",
         "New message from IC: What did you find?\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff\n[SYSTEM] You have the logs. Report findings to IC.",
         "New message from IC: Status?\nObs: auth-api at 99.8% CPU. High latency detected.\n[SYSTEM] Investigation complete. Message IC with your findings.",
         "New message from IC: What did you find?\nObs: notification-worker is using 8000MB RAM while payment-db is throttled by node memory pressure.\n[SYSTEM] Investigation complete. Report noisy neighbor root cause to IC.",
+        "New message from IC: What did you find?\nObs: session-cache-primary cache_epoch=1842 but session-cache-replica cache_epoch=1837.\n[SYSTEM] Investigation complete. Report split-brain root cause to IC.",
     ],
     "L2_DB_SME": [
         # Task2: payment-db crash fix
@@ -154,5 +171,11 @@ SCENARIO_MESSAGES = {
         "New message from IC: Apply UPDATE_CONFIG to notification-worker with memory_limit_mb 2048.",
         "New message from IC: Noisy neighbor worker is causing DB latency.\nObs: notification-worker MEM=8000MB, payment-db LAT=650ms.",
         "New message from IC: Set notification-worker memory limit to 2048MB.\nObs: [OK] notification-worker memory limit set to 2048MB.",
+
+        # Task5: cache replica repair
+        "New message from IC: session-cache-replica has divergent cache_epoch 1837 while primary is 1842. Repair the replica.",
+        "New message from IC: Cache split-brain detected. Apply REPAIR_REPLICA to session-cache-replica.",
+        "New message from IC: checkout-api is only the symptom; repair session-cache-replica to resync cache epochs.",
+        "New message from IC: Repair session-cache-replica.\nObs: [OK] session-cache-replica resynced to primary cache epoch.",
     ],
 }

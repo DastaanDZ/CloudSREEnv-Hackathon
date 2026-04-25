@@ -101,7 +101,12 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
 def suggested_l1_log_action(history: str, task_id: str) -> str:
     """Return the exact GET_LOGS action L1 should take before reporting."""
     history_lower = history.lower()
-    if "task4" in task_id or "notification-worker" in history_lower or "8000mb" in history_lower or "memory pressure" in history_lower:
+    if "task5" in task_id or "session-cache" in history_lower or "cart_total_mismatch" in history_lower or "split-brain" in history_lower:
+        if "session-cache-primary" not in history_lower:
+            service_id = "session-cache-primary"
+        else:
+            service_id = "session-cache-replica"
+    elif "task4" in task_id or "notification-worker" in history_lower or "8000mb" in history_lower or "memory pressure" in history_lower:
         service_id = "notification-worker"
     elif "task2" in task_id or "payment-db" in history_lower or "oom" in history_lower or "crash" in history_lower:
         service_id = "payment-db"
@@ -125,6 +130,14 @@ def task4_has_worker_evidence(env: CloudSREEnv, task_id: str) -> bool:
         )
         for a in env.action_history
     )
+
+def task5_has_split_brain_evidence(env: CloudSREEnv, task_id: str) -> bool:
+    """Task5 requires comparing both cache nodes before repair."""
+    if "task5" not in task_id:
+        return False
+    checked_primary = any(a.action_type == ActionType.GET_LOGS and a.service_id == "session-cache-primary" for a in env.action_history)
+    checked_replica = any(a.action_type == ActionType.GET_LOGS and a.service_id == "session-cache-replica" for a in env.action_history)
+    return checked_primary and checked_replica
 
 def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
     """Return the required IC->L2 action once L1 evidence exists."""
@@ -152,6 +165,12 @@ def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
             "target": "L2_DB_SME",
             "message": "Root cause is notification-worker memory leak at 8000MB starving payment-db. Apply UPDATE_CONFIG memory_limit_mb 2048.",
         }
+    if task5_has_split_brain_evidence(env, task_id):
+        return {
+            "action_type": "MESSAGE_CHANNEL",
+            "target": "L2_DB_SME",
+            "message": "Root cause is cache split-brain: session-cache-primary epoch 1842 and session-cache-replica epoch 1837. Apply REPAIR_REPLICA to session-cache-replica.",
+        }
     return None
 
 def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
@@ -174,6 +193,11 @@ def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
             and a.memory_limit_mb <= 2048
             for a in env.action_history
         )
+    if "task5" in task_id:
+        return any(
+            a.action_type == ActionType.REPAIR_REPLICA and a.service_id == "session-cache-replica"
+            for a in env.action_history
+        )
     return False
 
 def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
@@ -192,6 +216,8 @@ def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
         return "task3 remediation complete: auth-api was scaled."
     elif "task4" in task_id and l2_fix_applied(env, task_id):
         return "task4 remediation complete: notification-worker memory limit was applied."
+    elif "task5" in task_id and l2_fix_applied(env, task_id):
+        return "task5 remediation complete: session-cache-replica was repaired."
     return None
 
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
@@ -256,7 +282,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                     agent_histories[current_agent] += f"\n[SYSTEM] Do not repeat or report yet. Your next action must be exactly: {next_action}"
             elif current_agent == "L2_DB_SME":
                 last_l2_key = recent_actions[current_agent][-1]
-                if "RESTART" in last_l2_key or "SCALE" in last_l2_key or "UPDATE_CONFIG" in last_l2_key:
+                if "RESTART" in last_l2_key or "SCALE" in last_l2_key or "UPDATE_CONFIG" in last_l2_key or "REPAIR_REPLICA" in last_l2_key:
                     agent_histories[current_agent] += "\n[SYSTEM] Fix already applied successfully. Do NOT repeat it. Report completion to IC now: {\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
                 else:
                     agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
@@ -305,6 +331,32 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             continue
 
         if (current_agent == "L1_Triage"
+                and "task5" in task_id
+                and action.action_type in (ActionType.RESTART, ActionType.SCALE)
+                and action.service_id == "checkout-api"):
+            logger.warning("Task5 trap detected: L1 tried to remediate checkout-api.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] L1 is read-only and checkout-api is only the symptom. "
+                "Compare cache epochs with GET_LOGS on session-cache-primary and session-cache-replica."
+            )
+            continue
+
+        if (current_agent == "L1_Triage"
+                and "task5" in task_id
+                and action.action_type == ActionType.MESSAGE_CHANNEL
+                and action.target == "IC"
+                and not task5_has_split_brain_evidence(env, task_id)):
+            logger.warning("Task5 report blocked: L1 has not compared both cache nodes.")
+            recent_actions[current_agent].pop()
+            next_action = suggested_l1_log_action(agent_histories[current_agent], task_id)
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] You must compare both cache nodes before reporting split-brain. "
+                f"Use exactly: {next_action}"
+            )
+            continue
+
+        if (current_agent == "L1_Triage"
                 and "task4" in task_id
                 and action.action_type == ActionType.MESSAGE_CHANNEL
                 and action.target == "IC"
@@ -349,12 +401,25 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             continue
 
         if (current_agent == "L2_DB_SME"
+                and "task5" in task_id
+                and not l2_fix_applied(env, task_id)
+                and (action.action_type != ActionType.REPAIR_REPLICA or action.service_id != "session-cache-replica")):
+            logger.warning("Task5 fix blocked: L2 must repair session-cache-replica.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] Wrong target. checkout-api is the symptom. "
+                "Repair the stale cache replica exactly: "
+                "{\"action_type\": \"REPAIR_REPLICA\", \"service_id\": \"session-cache-replica\"}"
+            )
+            continue
+
+        if (current_agent == "L2_DB_SME"
                 and l2_fix_applied(env, task_id)
-                and action.action_type in (ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG)):
+                and action.action_type in (ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG, ActionType.REPAIR_REPLICA)):
             logger.warning("L2 fix already applied; blocking repeated remediation.")
             recent_actions[current_agent].pop()
             agent_histories[current_agent] += (
-                "\n[SYSTEM] Fix already applied. Do not repeat RESTART, SCALE, or UPDATE_CONFIG. "
+                "\n[SYSTEM] Fix already applied. Do not repeat RESTART, SCALE, UPDATE_CONFIG, or REPAIR_REPLICA. "
                 "Report completion with exactly: "
                 "{\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
             )
@@ -439,6 +504,7 @@ def main():
         "task2_self_healing",
         "task3_latency_resolution",
         "task4_resource_contention",
+        "task5_split_brain_cache_consistency",
     ]
     
     results = {}
