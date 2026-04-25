@@ -28,18 +28,20 @@ VALID_ACTIONS = {"LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "MESSAGE_CHANN
 VALID_TARGETS = {"IC", "L1_Triage", "L2_DB_SME"}
 
 # ---------------------------------------------------------------------------
-# 1. Continuous Reward Function (High Variance for GRPO)
+# 1. Workflow-Aware Reward Function for Multi-Agent SRE
 # ---------------------------------------------------------------------------
 def sre_rubric_reward(prompts, completions, **kwargs):
     """
-    Continuous reward function designed for GRPO variance.
+    Workflow-aware reward function that teaches correct SRE behavior patterns.
     
-    Unlike discrete rewards, this function produces fine-grained floating-point
-    scores that differentiate even valid JSON completions based on:
-    - Format quality (conciseness, cleanliness)
-    - Semantic correctness (valid action types, service names, targets)
-    - Contextual relevance (appropriate action for the given scenario)
-    - Environment feedback (dense rewards from CloudSREEnv rubric)
+    Key insight: Single-turn training must encode multi-turn workflow knowledge
+    by heavily rewarding/penalizing actions based on scenario context.
+    
+    Workflow rules encoded:
+    - L1_Triage MUST use LIST_SERVICES or GET_LOGS before MESSAGE_CHANNEL
+    - IC should delegate to L2_DB_SME when error/fix is mentioned
+    - Only IC should use CLOSE_INCIDENT
+    - L2_DB_SME should use RESTART/SCALE, not just MESSAGE_CHANNEL
     """
     rewards = []
     
@@ -57,169 +59,193 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             continue
         
         # =====================================================================
-        # STAGE 2: Prose/verbosity penalties (continuous, based on severity)
+        # STAGE 2: Prose/verbosity penalties
         # =====================================================================
         prose_indicators = ["**", "Here's", "Let me", "Sure,", "Certainly", 
-                          "```", "The ", "This ", "I will", "I'll"]
+                          "```", "I will", "I'll", "First,", "To "]
         prose_count = sum(1 for p in prose_indicators if p in raw_text)
-        reward -= prose_count * 0.08  # -0.08 per prose indicator (continuous)
+        reward -= prose_count * 0.1
         
         # =====================================================================
         # STAGE 3: JSON structure detection
         # =====================================================================
         if "{" not in raw_text or "}" not in raw_text:
-            rewards.append(max(-1.0, reward - 0.4))
+            rewards.append(max(-1.0, reward - 0.5))
             continue
         
-        # Extract JSON - reward based on position (earlier = better)
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not json_match:
-            rewards.append(max(-1.0, reward - 0.3))
+            rewards.append(max(-1.0, reward - 0.4))
             continue
         
         json_str = json_match.group(0)
         json_start_pos = json_match.start()
         
-        # Reward for JSON appearing early in response (continuous: 0.0 to 0.15)
-        early_bonus = max(0, 0.15 - (json_start_pos * 0.01))
-        reward += early_bonus
+        # Strong bonus for JSON appearing immediately (position 0-5)
+        if json_start_pos <= 5:
+            reward += 0.15
+        elif json_start_pos <= 20:
+            reward += 0.08
+        else:
+            reward -= 0.05 * (json_start_pos / 50)
         
         # =====================================================================
-        # STAGE 4: JSON parsing and format quality
+        # STAGE 4: JSON parsing and compactness
         # =====================================================================
         try:
             action_dict = json.loads(json_str)
-            reward += 0.20  # Base reward for valid JSON
+            reward += 0.15
         except json.JSONDecodeError:
-            rewards.append(max(-1.0, reward - 0.25))
+            rewards.append(max(-1.0, reward - 0.3))
             continue
         
-        # Format quality bonuses (continuous variance)
-        # Compact JSON (fewer characters) is better
+        # Strongly reward compact JSON
         json_length = len(json_str)
-        if json_length < 80:
-            reward += 0.10
-        elif json_length < 120:
-            reward += 0.05
-        elif json_length > 200:
-            reward -= 0.05 * ((json_length - 200) / 100)  # Progressive penalty
+        if json_length < 60:
+            reward += 0.12
+        elif json_length < 100:
+            reward += 0.06
+        elif json_length > 150:
+            reward -= 0.10
         
-        # Single-line JSON bonus
         if '\n' not in json_str:
             reward += 0.05
         
-        # No extra whitespace bonus
-        if '  ' not in json_str and '\t' not in json_str:
-            reward += 0.03
-        
         # =====================================================================
-        # STAGE 5: Semantic validation (action schema quality)
+        # STAGE 5: Action type validation
         # =====================================================================
         action_type = action_dict.get("action_type", "")
         
         if not action_type:
-            reward -= 0.20
-            rewards.append(max(-1.0, min(1.0, reward)))
+            rewards.append(max(-1.0, reward - 0.3))
             continue
         
-        # Valid action type bonus
         if action_type in VALID_ACTIONS:
-            reward += 0.15
+            reward += 0.10
         else:
-            reward -= 0.15
-            # Partial credit for close matches
-            for valid in VALID_ACTIONS:
-                if valid.lower() in action_type.lower() or action_type.lower() in valid.lower():
-                    reward += 0.05
-                    break
-        
-        # Service ID validation (continuous based on correctness)
-        service_id = action_dict.get("service_id", "")
-        if action_type in ["GET_LOGS", "RESTART", "SCALE"]:
-            if service_id in VALID_SERVICES:
-                reward += 0.10
-                # Extra bonus if service matches scenario context
-                if service_id in prompt_str.lower():
-                    reward += 0.08
-            elif service_id:
-                reward -= 0.08  # Hallucinated service name
-            else:
-                reward -= 0.12  # Missing required field
-        
-        # Target validation for MESSAGE_CHANNEL
-        target = action_dict.get("target", "")
-        if action_type == "MESSAGE_CHANNEL":
-            if target in VALID_TARGETS:
-                reward += 0.08
-            elif target:
-                reward -= 0.06
-            else:
-                reward -= 0.10
-            
-            # Has message content
-            if action_dict.get("message"):
-                msg_len = len(action_dict["message"])
-                if 5 < msg_len < 200:
-                    reward += 0.05
-        
-        # CPU value validation for SCALE
-        if action_type == "SCALE":
-            cpu_value = action_dict.get("cpu_value")
-            if isinstance(cpu_value, int):
-                if cpu_value >= 2048:
-                    reward += 0.10  # Correct scaling value
-                elif cpu_value >= 1024:
-                    reward += 0.03
-                else:
-                    reward -= 0.05
-            else:
-                reward -= 0.08  # Missing or invalid cpu_value
+            reward -= 0.20
         
         # =====================================================================
-        # STAGE 6: Role-appropriate action bonus
+        # STAGE 6: WORKFLOW-AWARE SCORING (Critical for learning correct behavior)
         # =====================================================================
         role = _detect_role_from_prompt(prompt_str)
+        prompt_lower = prompt_str.lower()
         
-        # Role-action appropriateness (continuous rewards)
-        role_action_scores = {
-            "IC": {"MESSAGE_CHANNEL": 0.12, "CLOSE_INCIDENT": 0.10},
-            "L1_Triage": {"LIST_SERVICES": 0.12, "GET_LOGS": 0.12, "MESSAGE_CHANNEL": 0.08},
-            "L2_DB_SME": {"RESTART": 0.12, "SCALE": 0.12, "MESSAGE_CHANNEL": 0.08},
-        }
+        # --- IC Workflow ---
+        if role == "IC":
+            if action_type == "MESSAGE_CHANNEL":
+                target = action_dict.get("target", "")
+                # IC should delegate to L1 for investigation
+                if "initial alert" in prompt_lower or "system alert" in prompt_lower:
+                    if target == "L1_Triage":
+                        reward += 0.25  # Correct: delegate investigation
+                    elif target == "L2_DB_SME":
+                        reward += 0.10  # Acceptable but not ideal first step
+                # IC should delegate to L2 when root cause is known
+                elif "root cause" in prompt_lower or "found" in prompt_lower or "reports:" in prompt_lower:
+                    if target == "L2_DB_SME":
+                        reward += 0.30  # Correct: delegate fix to L2
+                    elif target == "L1_Triage":
+                        reward -= 0.10  # Wrong: already have diagnosis
+                        
+            elif action_type == "CLOSE_INCIDENT":
+                # Only close when fix is confirmed
+                if "fix applied" in prompt_lower or "restarted" in prompt_lower or "scaled" in prompt_lower or "healthy" in prompt_lower:
+                    reward += 0.35  # Correct: close after fix confirmed
+                else:
+                    reward -= 0.25  # Premature closure
+                    
+            elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE"]:
+                reward -= 0.20  # IC shouldn't do these directly
         
-        if action_type in role_action_scores.get(role, {}):
-            reward += role_action_scores[role][action_type]
-        elif action_type in ["RESTART", "SCALE"] and role != "L2_DB_SME":
-            reward -= 0.15  # RBAC violation
-        
-        # =====================================================================
-        # STAGE 7: Environment execution (dense rewards)
-        # =====================================================================
-        try:
-            action_dict["agent_id"] = role
-            env = CloudSREEnv()
-            
-            # Select scenario based on prompt context
-            prompt_lower = prompt_str.lower()
-            if "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
-                env.reset(task_id="task2_self_healing")
-            elif "latency" in prompt_lower or "slow" in prompt_lower or "cpu" in prompt_lower:
-                env.reset(task_id="task3_latency_resolution")
-            else:
-                env.reset(task_id="task1_status_audit")
-            
-            action = Action(**action_dict)
-            _, reward_obj, done, _ = env.step(action)
-            
-            # Use environment's breakdown for fine-grained rewards
-            for component, value in reward_obj.breakdown.items():
-                reward += value * 0.3  # Scale env rewards
-            
-            if done and reward_obj.value > 0:
-                reward += 0.20  # Task completion bonus
+        # --- L1_Triage Workflow ---
+        elif role == "L1_Triage":
+            if action_type == "LIST_SERVICES":
+                # L1 should list services when asked to investigate
+                if "investigate" in prompt_lower or "check" in prompt_lower or "audit" in prompt_lower or "list" in prompt_lower:
+                    reward += 0.35  # Correct diagnostic action
+                else:
+                    reward += 0.15  # Still valid
+                    
+            elif action_type == "GET_LOGS":
+                service_id = action_dict.get("service_id", "")
+                if service_id in VALID_SERVICES:
+                    reward += 0.30  # Correct diagnostic action
+                    # Extra if service matches context
+                    if service_id.replace("-", "") in prompt_lower.replace("-", ""):
+                        reward += 0.15
+                else:
+                    reward -= 0.10  # Hallucinated service
+                    
+            elif action_type == "MESSAGE_CHANNEL":
+                # L1 should only message AFTER doing diagnostics
+                # Penalize if prompt suggests they should be investigating
+                if "investigate" in prompt_lower or "check" in prompt_lower or "list" in prompt_lower or "get logs" in prompt_lower:
+                    reward -= 0.20  # Should do diagnostics first!
+                else:
+                    reward += 0.10  # Reporting findings is okay
+                    
+            elif action_type == "CLOSE_INCIDENT":
+                reward -= 0.40  # L1 should NEVER close incidents
                 
-        except Exception:
-            reward -= 0.05  # Small penalty for env execution failure
+            elif action_type in ["RESTART", "SCALE"]:
+                reward -= 0.35  # L1 has no write permissions
+        
+        # --- L2_DB_SME Workflow ---
+        elif role == "L2_DB_SME":
+            if action_type == "RESTART":
+                service_id = action_dict.get("service_id", "")
+                if service_id in VALID_SERVICES:
+                    reward += 0.35  # Correct fix action
+                    if "restart" in prompt_lower or "crash" in prompt_lower or "error" in prompt_lower:
+                        reward += 0.15  # Matches requested action
+                else:
+                    reward -= 0.10
+                    
+            elif action_type == "SCALE":
+                service_id = action_dict.get("service_id", "")
+                cpu_value = action_dict.get("cpu_value")
+                if service_id in VALID_SERVICES and isinstance(cpu_value, int):
+                    if cpu_value >= 2048:
+                        reward += 0.35  # Correct scale value
+                    elif cpu_value >= 1024:
+                        reward += 0.15
+                    else:
+                        reward -= 0.10  # Too low
+                    if "scale" in prompt_lower or "cpu" in prompt_lower or "latency" in prompt_lower:
+                        reward += 0.15
+                else:
+                    reward -= 0.15
+                    
+            elif action_type == "MESSAGE_CHANNEL":
+                # L2 should message only AFTER applying fix
+                if "apply" in prompt_lower or "fix" in prompt_lower or "restart" in prompt_lower or "scale" in prompt_lower:
+                    reward -= 0.15  # Should fix first, not just message!
+                else:
+                    reward += 0.10  # Reporting completion is okay
+                    
+            elif action_type == "CLOSE_INCIDENT":
+                reward -= 0.40  # L2 should NEVER close incidents
+                
+            elif action_type in ["LIST_SERVICES", "GET_LOGS"]:
+                reward -= 0.15  # L2 should act, not investigate
+        
+        # =====================================================================
+        # STAGE 7: Field completeness validation
+        # =====================================================================
+        if action_type in ["GET_LOGS", "RESTART", "SCALE"]:
+            if not action_dict.get("service_id"):
+                reward -= 0.15
+                
+        if action_type == "SCALE":
+            if not isinstance(action_dict.get("cpu_value"), int):
+                reward -= 0.15
+                
+        if action_type == "MESSAGE_CHANNEL":
+            if not action_dict.get("target"):
+                reward -= 0.15
+            if not action_dict.get("message"):
+                reward -= 0.10
         
         # =====================================================================
         # Final: Clamp to [-1.0, 1.0]
@@ -305,21 +331,22 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    # --- GRPO Magic Settings ---
+    # --- GRPO Training Configuration ---
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
-        learning_rate=2e-5,
+        learning_rate=5e-5,           # Increased LR for faster convergence
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=4, # More accumulation for stability
         num_generations=4, 
         generation_batch_size=4, 
-        logging_steps=1,
-        max_steps=50, 
+        logging_steps=5,
+        max_steps=150,                # More steps to learn workflow patterns
         report_to="none",
-        # CHANGED: Enable mixed-precision training for Nvidia T4
         fp16=True, 
-        # CHANGED: Enable gradient checkpointing so we don't OOM (Out of Memory)
-        gradient_checkpointing=True 
+        gradient_checkpointing=True,
+        max_completion_length=64,     # Limit verbosity - force concise JSON
+        # Temperature for generation diversity
+        temperature=0.7,
     )
     
     trainer = GRPOTrainer(
