@@ -106,6 +106,13 @@ def suggested_l1_log_action(history: str, task_id: str) -> str:
         service_id = "auth-api"
     return json.dumps({"action_type": "GET_LOGS", "service_id": service_id})
 
+def task1_has_required_evidence(env: CloudSREEnv, task_id: str) -> bool:
+    """Task1 succeeds only after auth-api logs and before any remediation."""
+    return "task1" in task_id and any(
+        a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api"
+        for a in env.action_history
+    )
+
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
@@ -173,6 +180,24 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 else:
                     agent_histories[current_agent] += "\n[SYSTEM] Try a different action. Delegate fix to L2_DB_SME or close the incident."
 
+        if action.action_type == ActionType.MESSAGE_CHANNEL and action.target not in agent_histories:
+            logger.warning(f"Invalid MESSAGE_CHANNEL target from {current_agent}: {action.target}")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += "\n[SYSTEM] Invalid target. Use exactly one of: IC, L1_Triage, L2_DB_SME."
+            continue
+
+        if (current_agent == "IC"
+                and task1_has_required_evidence(env, task_id)
+                and action.action_type == ActionType.MESSAGE_CHANNEL
+                and action.target == "L2_DB_SME"):
+            logger.warning("Task1 is RCA-only; blocking IC delegation to L2.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] Task1 is certificate RCA only. Do NOT delegate to L2_DB_SME and do NOT remediate. "
+                "Close now with exactly: {\"action_type\": \"CLOSE_INCIDENT\"}"
+            )
+            continue
+
         # Safety net: L1 must investigate before reporting to IC.
         # Without this, L1 can shortcut by messaging IC immediately, which derails
         # task1 (no GET_LOGS evidence -> CLOSE_INCIDENT rejected) and wastes turns.
@@ -201,9 +226,6 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             continue
 
         if action.action_type == ActionType.MESSAGE_CHANNEL:
-            if action.target not in agent_histories:
-                agent_histories[current_agent] += f"\n[ERROR] Invalid target '{action.target}'. Valid targets: IC, L1_Triage, L2_DB_SME"
-                continue
             msg = f"\nNew message from {current_agent}: {action.message}"
             agent_histories[action.target] += msg
             current_agent = action.target 
