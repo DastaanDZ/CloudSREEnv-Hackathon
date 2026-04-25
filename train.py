@@ -638,6 +638,30 @@ def generate_transition_focus_prompts(num_samples: int = 80):
         (
             "IC",
             "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\n"
+            "New message from L1_Triage: Root cause is payment-db CrashLoopBackOff/OOMKilled. payment-db needs restart.\n"
+            "L1 has already reported the root cause. Delegate remediation to L2_DB_SME now.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] payment-db Error.\n"
+            "New message from L1_Triage: payment-db logs show OOMKilled and CrashLoopBackOff.\n"
+            "Do not ask L1 again. Send restart instructions to L2_DB_SME.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\n"
+            "New message from L1_Triage: Root cause is auth-api CPU saturation under high RPS. auth-api needs scaling.\n"
+            "L1 has already reported the root cause. Delegate remediation to L2_DB_SME now.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] High latency detected on auth-api.\n"
+            "New message from L1_Triage: auth-api logs show RPS=3500 and CPU usage 99.8%.\n"
+            "Do not ask L1 again. Send scaling instructions to L2_DB_SME.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\n"
             "New message from L1_Triage: Root cause is payment-db CrashLoopBackOff/OOMKilled.\n"
             "New message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
         ),

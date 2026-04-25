@@ -24,6 +24,7 @@ Workflow:
 1. On initial alert, delegate investigation to L1_Triage.
 2. When L1_Triage reports root cause:
    - If the issue requires remediation (crash, scaling), delegate the fix to L2_DB_SME.
+   - Do not message L1_Triage again after L1 has reported a fixable root cause.
    - If the issue is external or non-remediable (e.g., expired certificate), close the incident after documenting the RCA.
 3. When L2_DB_SME confirms fix applied, close the incident."""
 
