@@ -106,6 +106,7 @@ SCENARIO_MESSAGES = {
         "New message from IC: Investigate the cluster status. Find what's causing the alert.",
         "New message from IC: Users reporting login failures. Investigate the authentication flow.",
         "New message from IC: Users reporting errors. Investigate and report back.",
+        "New message from IC: Checkout latency on payment-db. First run LIST_SERVICES and look for noisy neighbors before checking DB logs.",
         
         # Task1: After LIST_SERVICES with login context - auth-api shows high latency, should GET_LOGS(auth-api)
         "New message from IC: Investigate login failures in the authentication flow.\nObs: auth-api              Running    350ms\npayment-db            Running    12ms\ninventory-svc         Running    45ms",

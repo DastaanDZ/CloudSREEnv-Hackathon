@@ -270,6 +270,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 "notification-worker" in prompt_lower
                 and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "payment-db"])
             )
+            is_checkout_latency_context = "checkout latency" in prompt_lower or (
+                "payment-db" in prompt_lower and "latency" in prompt_lower
+            )
             
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
@@ -282,13 +285,17 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
                         manual_reward += 0.15
-                    if "payment-db" in prompt_lower and "latency" in prompt_lower:
-                        manual_reward += 0.10
+                    if is_checkout_latency_context:
+                        manual_reward += 0.25
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if has_log_content or has_reported:
                     manual_reward -= 0.40
+                elif is_checkout_latency_context and not has_service_list and service_id == "payment-db":
+                    manual_reward -= 0.55
+                elif is_resource_contention_context and service_id == "payment-db":
+                    manual_reward -= 0.65
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
@@ -304,7 +311,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
-                if has_log_content and target == "IC":
+                if is_checkout_latency_context and not is_resource_contention_context:
+                    manual_reward -= 0.65
+                elif has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
                     manual_reward += 0.85
                 elif has_reported:
@@ -374,6 +383,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
 
                 if fix_already_applied:
                     manual_reward -= 0.25
+                elif is_resource_contention_context and service_id != "notification-worker":
+                    manual_reward -= 0.80
                 elif service_id == "notification-worker" and isinstance(memory_limit_mb, int):
                     if memory_limit_mb <= 2048:
                         manual_reward += 0.75
@@ -743,7 +754,7 @@ def main():
     # A100 handles BF16 efficiently and SDPA avoids an extra flash-attn install.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         attn_implementation="sdpa",
     ).to(DEVICE)
     

@@ -57,7 +57,8 @@ def load_eval_model(mode="TRAINED"):
     # Load the pure base model weights
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_NAME, 
-        torch_dtype=torch.float16
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        attn_implementation="sdpa",
     ).to(DEVICE)
 
     if mode == "TRAINED":
@@ -115,6 +116,16 @@ def task1_has_required_evidence(env: CloudSREEnv, task_id: str) -> bool:
         for a in env.action_history
     )
 
+def task4_has_worker_evidence(env: CloudSREEnv, task_id: str) -> bool:
+    """Task4 requires evidence that notification-worker is the noisy neighbor."""
+    return "task4" in task_id and any(
+        (
+            a.action_type == ActionType.LIST_SERVICES
+            or (a.action_type == ActionType.GET_LOGS and a.service_id == "notification-worker")
+        )
+        for a in env.action_history
+    )
+
 def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
     """Return the required IC->L2 action once L1 evidence exists."""
     if "task2" in task_id and any(
@@ -135,10 +146,7 @@ def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
             "target": "L2_DB_SME",
             "message": "Root cause is auth-api CPU saturation. Scale auth-api to 2048 CPU.",
         }
-    if "task4" in task_id and any(
-        a.action_type == ActionType.GET_LOGS and a.service_id == "notification-worker"
-        for a in env.action_history
-    ):
+    if task4_has_worker_evidence(env, task_id):
         return {
             "action_type": "MESSAGE_CHANNEL",
             "target": "L2_DB_SME",
@@ -284,6 +292,31 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             )
             continue
 
+        if (current_agent == "L1_Triage"
+                and "task4" in task_id
+                and action.action_type == ActionType.GET_LOGS
+                and action.service_id == "payment-db"):
+            logger.warning("Task4 trap detected: L1 inspected payment-db instead of noisy neighbor.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] Task4 is noisy-neighbor resource contention. Do not chase payment-db. "
+                "Use exactly: {\"action_type\": \"GET_LOGS\", \"service_id\": \"notification-worker\"}"
+            )
+            continue
+
+        if (current_agent == "L1_Triage"
+                and "task4" in task_id
+                and action.action_type == ActionType.MESSAGE_CHANNEL
+                and action.target == "IC"
+                and not task4_has_worker_evidence(env, task_id)):
+            logger.warning("Task4 report blocked: L1 has no notification-worker evidence.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] You need noisy-neighbor evidence before reporting. "
+                "Use exactly: {\"action_type\": \"GET_LOGS\", \"service_id\": \"notification-worker\"}"
+            )
+            continue
+
         required_l2 = required_l2_delegation(env, task_id)
         if (current_agent == "IC"
                 and required_l2
@@ -294,6 +327,24 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             agent_histories[current_agent] += (
                 "\n[SYSTEM] L1 has already found the root cause. "
                 f"Your next action must be exactly: {json.dumps(required_l2)}"
+            )
+            continue
+
+        if (current_agent == "L2_DB_SME"
+                and "task4" in task_id
+                and not l2_fix_applied(env, task_id)
+                and (
+                    action.action_type != ActionType.UPDATE_CONFIG
+                    or action.service_id != "notification-worker"
+                    or action.memory_limit_mb is None
+                    or action.memory_limit_mb > 2048
+                )):
+            logger.warning("Task4 fix blocked: L2 must configure notification-worker, not payment-db.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] Wrong target. payment-db is the symptom. "
+                "Apply the noisy-neighbor fix exactly: "
+                "{\"action_type\": \"UPDATE_CONFIG\", \"service_id\": \"notification-worker\", \"memory_limit_mb\": 2048}"
             )
             continue
 
