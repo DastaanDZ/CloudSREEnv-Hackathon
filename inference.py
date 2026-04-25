@@ -9,6 +9,7 @@ from typing import Dict, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from server.app import Action, ActionType, CloudSREEnv
+from prompts import PROMPTS  # Shared prompts with train.py
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
@@ -23,22 +24,6 @@ EVAL_MODE = "TRAINED"
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ---------------------------------------------------------------------------
-# 2. PROMPTS (Shared with train.py)
-# ---------------------------------------------------------------------------
-IC_PROMPT = """You are the Incident Commander (IC). Orchestrate the response.
-- Task1: Once L1_Triage reports logs, use CLOSE_INCIDENT.
-- Task2/3: Tell L2_DB_SME the service_id (e.g. payment-db) to fix.
-- Use CLOSE_INCIDENT once fixed."""
-
-L1_PROMPT = """You are the L1 Triage Agent. Monitor cluster health.
-1. Run LIST_SERVICES. 2. Run GET_LOGS on suspicious pods. 3. MESSAGE_CHANNEL to IC."""
-
-L2_PROMPT = """You are the L2 Database SME.
-- If crashing: RESTART. - If high CPU: SCALE to 2048. - Use MESSAGE_CHANNEL to tell IC 'fix applied'."""
-
-PROMPTS = {"IC": IC_PROMPT, "L1_Triage": L1_PROMPT, "L2_DB_SME": L2_PROMPT}
 
 # ---------------------------------------------------------------------------
 # 3. CORE EVALUATION FUNCTIONS (Encapsulated)

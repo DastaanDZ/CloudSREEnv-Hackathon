@@ -12,4 +12,5 @@ transformers>=4.38.0
 accelerate>=0.27.0
 trl>=0.8.0
 datasets>=2.16.0
+peft>=0.10.0
 matplotlib>=3.7.0
