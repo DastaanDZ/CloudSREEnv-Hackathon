@@ -38,7 +38,8 @@ EVAL_MODE = "TRAINED"
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
+# BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
+BASE_MODEL_NAME = "Qwen/Qwen3.5-4B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
@@ -91,10 +92,10 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
             **inputs, 
             max_new_tokens=128, 
             pad_token_id=tokenizer.eos_token_id,
-            do_sample=True,             # Must be True to use temperature
-            temperature=0.3,            # Adds slight creativity to break loops
-            top_p=0.9,                  # REQUIRED by Qwen to enable sampling
-            repetition_penalty=1.15     # Punishes the model for repeating the same action
+            do_sample=True,             # REQUIRED: Allow the model to explore
+            temperature=0.6,            # Qwen3 recommended temperature for reasoning
+            top_p=0.95,                 # REQUIRED to enable sampling properly
+            repetition_penalty=1.15     # Punishes repeating the same action
         )
     
     # Extract only the newly generated tokens

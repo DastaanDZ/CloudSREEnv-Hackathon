@@ -32,7 +32,8 @@ def extract_first_json_object(raw_text: str) -> tuple[dict | None, int]:
 
 # --- Configuration ---
 # MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" 
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+# MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+MODEL_NAME = "Qwen/Qwen3.5-4B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
