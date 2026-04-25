@@ -52,6 +52,18 @@ class Reward(BaseModel):
     reason: str = ""
     breakdown: Dict[str, float] = Field(default_factory=dict) # NEW: For OpenEnv Rubrics
 
+class IncidentState(BaseModel):
+    """Principle-level SRE state used for task-agnostic reward shaping."""
+    observations_collected: List[str] = Field(default_factory=list)
+    confidence_level: float = 0.0
+    root_cause: Optional[str] = None
+    fixability: str = "unknown"  # unknown | fixable | external_or_rca_only
+    remediation_attempted: bool = False
+    remediation_successful: bool = False
+    l1_reported: bool = False
+    l2_delegated: bool = False
+    l2_reported_fix: bool = False
+
 # ---------------------------------------------------------------------------
 # Service & MockCloud
 # ---------------------------------------------------------------------------
@@ -163,6 +175,8 @@ class CloudSREEnv:
         self.cloud = MockCloud()
         self.current_task = ""
         self.action_history: List[Action] = []
+        self.incident_state = IncidentState()
+        self.scenario_profile: Dict[str, object] = {}
         self.done = False
         self.steps_taken = 0
         self.max_steps = 15 # RL needs a strict cutoff
@@ -170,6 +184,7 @@ class CloudSREEnv:
     def reset(self, task_id: Optional[str] = None, scenario: Optional[str] = None) -> Observation:
         self.current_task = task_id or "task1_tls_certificate_rca"
         self.action_history.clear()
+        self.incident_state = IncidentState()
         self.done = False
         self.steps_taken = 0
 
@@ -182,6 +197,7 @@ class CloudSREEnv:
         else:
             self.cloud.reset(scenario=scenario or "healthy")
 
+        self.scenario_profile = self._build_scenario_profile()
         return Observation(text_output="\n".join(self.cloud.incident_channel))
 
     def step(self, action: Action) -> tuple[Observation, Reward, bool, dict]:
@@ -190,7 +206,6 @@ class CloudSREEnv:
         if self.done or self.steps_taken > self.max_steps:
             return Observation(text_output="Episode Terminated."), Reward(value=0.0, reason="Max steps reached or already done."), True, {}
 
-        self.action_history.append(action)
         obs_text = ""
 
         # --- HARD DUPLICATE BLOCK ---
@@ -210,8 +225,11 @@ class CloudSREEnv:
                 {},
             )
 
+        self.action_history.append(action)
+
         # --- NEW: OPENENV COMPOSABLE RUBRIC EVALUATION ---
         total_reward, breakdown, reason = self._calculate_rubric(action)
+        state_before = self.incident_state.model_copy(deep=True)
 
         # If it was an invalid format, immediately return the penalty (Don't execute)
         if action.action_type == ActionType.INVALID_FORMAT:
@@ -268,16 +286,25 @@ class CloudSREEnv:
             obs_text = "[OK] Message posted to Incident Channel."
 
         elif action.action_type == ActionType.CLOSE_INCIDENT:
+            principle_reward, principle_breakdown = self._calculate_principle_reward(action, state_before, "")
+            total_reward += principle_reward
+            breakdown.update(principle_breakdown)
             task_done, final_score = self._grade_terminal_state()
             if task_done:
                 self.done = True
                 total_reward += final_score
                 breakdown["task_completion"] = final_score
-                return Observation(text_output="[INCIDENT CLOSED] Task completed successfully."), Reward(value=total_reward, reason="Task Success", breakdown=breakdown), True, {}
+                capped_reward = max(-1.0, min(1.0, total_reward))
+                return Observation(text_output="[INCIDENT CLOSED] Task completed successfully."), Reward(value=capped_reward, reason="Task Success", breakdown=breakdown), True, {}
             else:
                 total_reward -= 0.5
                 breakdown["false_closure_penalty"] = -0.5
-                return Observation(text_output="[ERROR] Cannot close incident. Criteria not met."), Reward(value=total_reward, reason="Premature Closure", breakdown=breakdown), False, {}
+                capped_reward = max(-1.0, min(1.0, total_reward))
+                return Observation(text_output="[ERROR] Cannot close incident. Criteria not met."), Reward(value=capped_reward, reason="Premature Closure", breakdown=breakdown), False, {}
+
+        principle_reward, principle_breakdown = self._calculate_principle_reward(action, state_before, obs_text)
+        total_reward += principle_reward
+        breakdown.update(principle_breakdown)
 
         # Cap the reward between -1.0 and 1.0 to comply with OpenEnv Spec
         capped_reward = max(-1.0, min(1.0, total_reward))
@@ -303,12 +330,162 @@ class CloudSREEnv:
     def _is_duplicate(self, action: Action) -> bool:
         """True if any prior action this episode matches the current action's key."""
         key = self._action_match_key(action)
-        for prev in self.action_history[:-1]:
+        for prev in self.action_history:
             if prev.action_type in (ActionType.INVALID_FORMAT, ActionType.CLOSE_INCIDENT):
                 continue
             if self._action_match_key(prev) == key:
                 return True
         return False
+
+    def _build_scenario_profile(self) -> Dict[str, object]:
+        """Scenario facts consumed by task-agnostic principle rewards."""
+        if "task1" in self.current_task:
+            return {
+                "evidence_service": "auth-api",
+                "root_cause": "expired upstream TLS certificate",
+                "fixability": "external_or_rca_only",
+                "remediation_action": None,
+                "remediation_service": None,
+            }
+        if "task2" in self.current_task:
+            return {
+                "evidence_service": "payment-db",
+                "root_cause": "payment-db CrashLoopBackOff/OOMKilled",
+                "fixability": "fixable",
+                "remediation_action": ActionType.RESTART,
+                "remediation_service": "payment-db",
+            }
+        if "task3" in self.current_task:
+            return {
+                "evidence_service": "auth-api",
+                "root_cause": "auth-api CPU saturation",
+                "fixability": "fixable",
+                "remediation_action": ActionType.SCALE,
+                "remediation_service": "auth-api",
+                "min_cpu": 2048,
+            }
+        return {
+            "evidence_service": None,
+            "root_cause": None,
+            "fixability": "unknown",
+            "remediation_action": None,
+            "remediation_service": None,
+        }
+
+    def _remember_observation(self, key: str) -> bool:
+        """Record a newly collected observation. Returns True if it is new."""
+        if key in self.incident_state.observations_collected:
+            return False
+        self.incident_state.observations_collected.append(key)
+        return True
+
+    def _action_matches_remediation(self, action: Action) -> bool:
+        expected_action = self.scenario_profile.get("remediation_action")
+        expected_service = self.scenario_profile.get("remediation_service")
+        if not expected_action or action.action_type != expected_action or action.service_id != expected_service:
+            return False
+        if action.action_type == ActionType.SCALE:
+            min_cpu = int(self.scenario_profile.get("min_cpu", 0) or 0)
+            return bool(action.cpu_value is not None and action.cpu_value >= min_cpu)
+        return True
+
+    def _calculate_principle_reward(
+        self,
+        action: Action,
+        state_before: IncidentState,
+        obs_text: str,
+    ) -> tuple[float, dict]:
+        """Reward SRE principles instead of only task-specific action names."""
+        reward = 0.0
+        breakdown: Dict[str, float] = {}
+        evidence_service = self.scenario_profile.get("evidence_service")
+        fixability = str(self.scenario_profile.get("fixability", "unknown"))
+
+        if action.action_type == ActionType.LIST_SERVICES:
+            if self._remember_observation("service_list"):
+                breakdown["principle_new_observation"] = 0.12
+                reward += 0.12
+
+        elif action.action_type == ActionType.GET_LOGS:
+            obs_key = f"logs:{action.service_id}"
+            if action.service_id and self._remember_observation(obs_key):
+                breakdown["principle_new_observation"] = 0.18
+                reward += 0.18
+            if action.service_id == evidence_service:
+                old_confidence = self.incident_state.confidence_level
+                self.incident_state.confidence_level = max(self.incident_state.confidence_level, 0.75)
+                self.incident_state.root_cause = str(self.scenario_profile.get("root_cause") or "")
+                self.incident_state.fixability = fixability
+                if self.incident_state.confidence_level > old_confidence:
+                    breakdown["principle_confidence_gain"] = 0.22
+                    reward += 0.22
+                    breakdown["principle_fixability_classified"] = 0.15
+                    reward += 0.15
+            elif action.service_id:
+                breakdown["principle_irrelevant_evidence"] = -0.08
+                reward -= 0.08
+
+        elif action.action_type == ActionType.MESSAGE_CHANNEL:
+            target = action.target
+            if action.agent_id == "IC" and target == "L1_Triage" and state_before.confidence_level < 0.5:
+                breakdown["principle_delegate_investigation"] = 0.18
+                reward += 0.18
+            elif action.agent_id == "L1_Triage" and target == "IC":
+                self.incident_state.l1_reported = True
+                if state_before.confidence_level >= 0.5:
+                    breakdown["principle_report_after_evidence"] = 0.25
+                    reward += 0.25
+                else:
+                    breakdown["principle_report_without_evidence"] = -0.30
+                    reward -= 0.30
+            elif action.agent_id == "IC" and target == "L2_DB_SME":
+                self.incident_state.l2_delegated = True
+                if state_before.fixability == "fixable" and state_before.confidence_level >= 0.5:
+                    breakdown["principle_delegate_fixable_issue"] = 0.25
+                    reward += 0.25
+                elif state_before.fixability == "external_or_rca_only":
+                    breakdown["principle_unneeded_l2_escalation"] = -0.30
+                    reward -= 0.30
+                else:
+                    breakdown["principle_delegate_without_diagnosis"] = -0.20
+                    reward -= 0.20
+            elif action.agent_id == "L2_DB_SME" and target == "IC":
+                self.incident_state.l2_reported_fix = True
+                if state_before.remediation_successful:
+                    breakdown["principle_report_fix_complete"] = 0.20
+                    reward += 0.20
+                else:
+                    breakdown["principle_l2_report_without_fix"] = -0.12
+                    reward -= 0.12
+
+        elif action.action_type in (ActionType.RESTART, ActionType.SCALE):
+            self.incident_state.remediation_attempted = True
+            if state_before.fixability == "unknown" or state_before.confidence_level < 0.5:
+                breakdown["principle_remediate_before_diagnosis"] = -0.30
+                reward -= 0.30
+            elif state_before.fixability == "external_or_rca_only":
+                breakdown["principle_remediate_nonfixable_issue"] = -0.40
+                reward -= 0.40
+            elif self._action_matches_remediation(action):
+                self.incident_state.remediation_successful = True
+                breakdown["principle_correct_remediation"] = 0.35
+                reward += 0.35
+            else:
+                breakdown["principle_wrong_remediation"] = -0.25
+                reward -= 0.25
+
+        elif action.action_type == ActionType.CLOSE_INCIDENT:
+            ready_for_close = (
+                state_before.fixability == "external_or_rca_only" and state_before.confidence_level >= 0.5
+            ) or state_before.remediation_successful
+            if ready_for_close:
+                breakdown["principle_close_when_ready"] = 0.25
+                reward += 0.25
+            else:
+                breakdown["principle_premature_close"] = -0.30
+                reward -= 0.30
+
+        return reward, breakdown
 
     # --- DENSE REWARD RUBRIC ---
     def _calculate_rubric(self, action: Action) -> tuple[float, dict, str]:

@@ -5,7 +5,8 @@ Supports both 'BASE' model evaluation and 'TRAINED' adapter evaluation.
 
 from __future__ import annotations
 import json, os, re, logging, torch
-from typing import Dict, List
+from datetime import datetime
+from typing import Any, Dict, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from server.app import Action, ActionType, CloudSREEnv
@@ -40,10 +41,136 @@ TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TRACE_OUTPUT_DIR = "./episode_traces"
 
 # ---------------------------------------------------------------------------
 # 3. CORE EVALUATION FUNCTIONS (Encapsulated)
 # ---------------------------------------------------------------------------
+def _short_text(text: str, limit: int = 180) -> str:
+    """Keep dashboard rows readable without losing the full JSON trace."""
+    compact = " ".join(str(text).split())
+    return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+
+
+def _enum_value(value: Any) -> str:
+    return getattr(value, "value", str(value))
+
+
+def _action_summary(action: Action | None) -> str:
+    if action is None:
+        return ""
+    target = action.target or action.service_id or ""
+    action_type = _enum_value(action.action_type)
+    return f"{action_type} -> {target}" if target else action_type
+
+
+def new_episode_trace(task_id: str, initial_observation: str) -> dict:
+    return {
+        "task_id": task_id,
+        "eval_mode": EVAL_MODE,
+        "base_model": BASE_MODEL_NAME,
+        "started_at": datetime.utcnow().isoformat() + "Z",
+        "initial_observation": initial_observation,
+        "events": [],
+    }
+
+
+def record_trace_event(
+    trace: dict,
+    step: int,
+    agent: str,
+    *,
+    raw_reply: str = "",
+    action: Action | None = None,
+    observation: str = "",
+    reward: Any = None,
+    done: bool = False,
+    guardrail_reason: str | None = None,
+    parse_error: str | None = None,
+) -> None:
+    reward_value = None
+    reward_reason = ""
+    reward_breakdown = {}
+    if reward is not None:
+        reward_value = float(getattr(reward, "value", 0.0))
+        reward_reason = getattr(reward, "reason", "")
+        reward_breakdown = dict(getattr(reward, "breakdown", {}) or {})
+
+    trace["events"].append({
+        "step": step,
+        "agent": agent,
+        "raw_reply": raw_reply,
+        "action": _action_summary(action),
+        "action_json": action.model_dump(mode="json") if action is not None else None,
+        "observation": observation,
+        "reward": reward_value,
+        "reward_reason": reward_reason,
+        "reward_breakdown": reward_breakdown,
+        "done": done,
+        "guardrail_reason": guardrail_reason,
+        "parse_error": parse_error,
+    })
+
+
+def save_episode_trace(trace: dict, success: bool) -> None:
+    os.makedirs(TRACE_OUTPUT_DIR, exist_ok=True)
+    trace["success"] = success
+    trace["ended_at"] = datetime.utcnow().isoformat() + "Z"
+    trace["total_reward"] = sum(
+        event["reward"] for event in trace["events"] if event["reward"] is not None
+    )
+
+    safe_task = re.sub(r"[^a-zA-Z0-9_.-]+", "_", trace["task_id"])
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base_path = os.path.join(TRACE_OUTPUT_DIR, f"{timestamp}_{safe_task}")
+
+    with open(base_path + ".json", "w", encoding="utf-8") as f:
+        json.dump(trace, f, indent=2)
+
+    lines = [
+        f"# Episode Trace: {trace['task_id']}",
+        "",
+        f"- Mode: {trace['eval_mode']}",
+        f"- Base model: {trace['base_model']}",
+        f"- Success: {success}",
+        f"- Total env reward: {trace['total_reward']:.3f}",
+        "",
+        "## Step Dashboard",
+        "",
+        "| Step | Agent | Action | Reward | Done | Guardrail / Error | Observation |",
+        "|---:|---|---|---:|---|---|---|",
+    ]
+
+    for event in trace["events"]:
+        issue = event["guardrail_reason"] or event["parse_error"] or ""
+        reward_text = "" if event["reward"] is None else f"{event['reward']:.3f}"
+        lines.append(
+            "| {step} | {agent} | {action} | {reward} | {done} | {issue} | {obs} |".format(
+                step=event["step"],
+                agent=event["agent"],
+                action=_short_text(event["action"] or "-"),
+                reward=reward_text,
+                done=event["done"],
+                issue=_short_text(issue or "-"),
+                obs=_short_text(event["observation"] or "-"),
+            )
+        )
+
+    lines.extend(["", "## Reward Breakdown", ""])
+    for event in trace["events"]:
+        if not event["reward_breakdown"]:
+            continue
+        lines.append(f"### Step {event['step']} - {event['agent']} - {event['action']}")
+        for key, value in event["reward_breakdown"].items():
+            lines.append(f"- `{key}`: {value}")
+        lines.append("")
+
+    with open(base_path + ".md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    logger.info(f"Episode trace saved to {base_path}.json and {base_path}.md")
+
+
 def load_eval_model(mode="TRAINED"):
     """
     Loads the model only when explicitly called. 
@@ -168,6 +295,7 @@ def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
+    trace = new_episode_trace(task_id, obs.text_output)
     
     agent_histories = {agent: f"INITIAL ALERT:\n{obs.text_output}" for agent in PROMPTS}
     current_agent = "IC"
@@ -183,9 +311,20 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 logger.warning(f"[GUARDRAIL] {close_reason} Auto-closing incident.")
                 action = Action(action_type=ActionType.CLOSE_INCIDENT, agent_id=current_agent)
                 logger.info("ACTION: CLOSE_INCIDENT -> None")
-                step_obs, _, done, _ = env.step(action)
+                step_obs, reward_obj, done, _ = env.step(action)
+                record_trace_event(
+                    trace,
+                    step_n,
+                    current_agent,
+                    action=action,
+                    observation=step_obs.text_output,
+                    reward=reward_obj,
+                    done=done,
+                    guardrail_reason=close_reason,
+                )
                 if done:
                     logger.info(f"SUCCESS: {task_id} CLOSED SUCCESSFULLY.")
+                    save_episode_trace(trace, True)
                     return True
                 agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
                 continue
@@ -198,6 +337,13 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         action_dict = extract_first_json_object(raw_reply)
         if action_dict is None:
             logger.warning(f"PARSE ERROR: No valid JSON | Content: {raw_reply[:80]}...")
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                parse_error="No valid JSON object found.",
+            )
             agent_histories[current_agent] += "\n[SYSTEM] Error: Output ONE valid JSON object. No prose, no multiple objects."
             continue
 
@@ -206,6 +352,13 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             action = Action(**action_dict)
         except Exception as e:
             logger.warning(f"PARSE ERROR: {e} | Content: {raw_reply[:50]}...")
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                parse_error=str(e),
+            )
             agent_histories[current_agent] += "\n[SYSTEM] Error: Invalid action fields. Output ONE valid JSON object."
             continue
 
@@ -248,6 +401,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         if action.action_type == ActionType.MESSAGE_CHANNEL and action.target not in agent_histories:
             logger.warning(f"Invalid MESSAGE_CHANNEL target from {current_agent}: {action.target}")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="Invalid MESSAGE_CHANNEL target.",
+            )
             agent_histories[current_agent] += "\n[SYSTEM] Invalid target. Use exactly one of: IC, L1_Triage, L2_DB_SME."
             continue
 
@@ -257,6 +418,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and action.target == "L2_DB_SME"):
             logger.warning("Task1 is RCA-only; blocking IC delegation to L2.")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="Task1 is RCA-only; IC must close instead of delegating to L2.",
+            )
             agent_histories[current_agent] += (
                 "\n[SYSTEM] Task1 is certificate RCA only. Do NOT delegate to L2_DB_SME and do NOT remediate. "
                 "Close now with exactly: {\"action_type\": \"CLOSE_INCIDENT\"}"
@@ -270,6 +439,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and (action.action_type != ActionType.MESSAGE_CHANNEL or action.target != "L2_DB_SME")):
             logger.warning("IC has L1 evidence; forcing delegation to L2.")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="IC has fixable L1 evidence and must delegate remediation to L2.",
+            )
             agent_histories[current_agent] += (
                 "\n[SYSTEM] L1 has already found the root cause. "
                 f"Your next action must be exactly: {json.dumps(required_l2)}"
@@ -281,6 +458,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and action.action_type in (ActionType.RESTART, ActionType.SCALE)):
             logger.warning("L2 fix already applied; blocking repeated remediation.")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="L2 remediation was already applied; repeated fix blocked.",
+            )
             agent_histories[current_agent] += (
                 "\n[SYSTEM] Fix already applied. Do not repeat RESTART or SCALE. "
                 "Report completion with exactly: "
@@ -293,6 +478,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and action.action_type == ActionType.MESSAGE_CHANNEL):
             logger.warning("L2 fix is complete; forcing incident closure.")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="L2 fix is complete; IC must close incident.",
+            )
             agent_histories[current_agent] += (
                 "\n[SYSTEM] L2 has already applied the fix. "
                 "Close now with exactly: {\"action_type\": \"CLOSE_INCIDENT\"}"
@@ -304,6 +497,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and any(a.action_type == ActionType.GET_LOGS and a.service_id == action.service_id for a in env.action_history)):
             logger.warning("L1 already has logs; blocking repeated GET_LOGS.")
             recent_actions[current_agent].pop()
+            record_trace_event(
+                trace,
+                step_n,
+                current_agent,
+                raw_reply=raw_reply,
+                action=action,
+                guardrail_reason="L1 already gathered logs for this service.",
+            )
             agent_histories[current_agent] += (
                 "\n[SYSTEM] You already gathered these logs. "
                 "Report findings to IC with MESSAGE_CHANNEL."
@@ -322,13 +523,31 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 logger.warning(f"L1 attempted to report to IC without investigation. Rejecting.")
                 recent_actions[current_agent].pop()
                 next_action = suggested_l1_log_action(agent_histories[current_agent], task_id)
+                record_trace_event(
+                    trace,
+                    step_n,
+                    current_agent,
+                    raw_reply=raw_reply,
+                    action=action,
+                    guardrail_reason="L1 tried to report before collecting log evidence.",
+                )
                 agent_histories[current_agent] += (
                     "\n[SYSTEM] You must collect log evidence before reporting to IC. "
                     f"Do not use MESSAGE_CHANNEL now. Your next action must be exactly: {next_action}"
                 )
                 continue
 
-        step_obs, _, done, _ = env.step(action)
+        step_obs, reward_obj, done, _ = env.step(action)
+        record_trace_event(
+            trace,
+            step_n,
+            current_agent,
+            raw_reply=raw_reply,
+            action=action,
+            observation=step_obs.text_output,
+            reward=reward_obj,
+            done=done,
+        )
 
         # If the env hard-blocked the action, surface the obs to the current agent
         # and do NOT route (no message delivery, no current_agent switch).
@@ -344,6 +563,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         elif action.action_type == ActionType.CLOSE_INCIDENT:
             if done:
                 logger.info(f"SUCCESS: {task_id} CLOSED SUCCESSFULLY.")
+                save_episode_trace(trace, True)
                 return True
             else:
                 agent_histories[current_agent] += f"\nObs: {step_obs.text_output} The issue is not yet resolved. Delegate the fix to L2_DB_SME if not already done."
@@ -351,6 +571,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
 
     logger.error(f"FAILURE: {task_id} exceeded max steps.")
+    save_episode_trace(trace, False)
     return False
 
 # ---------------------------------------------------------------------------

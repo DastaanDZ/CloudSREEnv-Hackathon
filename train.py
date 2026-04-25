@@ -54,21 +54,21 @@ VALID_TARGETS = {"IC", "L1_Triage", "L2_DB_SME"}
 # ---------------------------------------------------------------------------
 # 1. Workflow-Aware Reward Function for Multi-Agent SRE
 # ---------------------------------------------------------------------------
-# Reward weighting: Adjusts based on prompt stage
-# Early-stage (fresh context): Trust env more (70% env, 30% manual)
-# Later-stage (accumulated context): Trust manual more (30% env, 70% manual)
-#   because fresh env doesn't reflect actions described in prompt
+# Reward weighting: the environment now includes principle-based state rewards
+# (new evidence, confidence gain, fixability, remediation readiness), while
+# manual heuristics remain as formatting/workflow backup signals.
 ENV_WEIGHT_EARLY = 0.70
 MANUAL_WEIGHT_EARLY = 0.30
-ENV_WEIGHT_LATER = 0.30
-MANUAL_WEIGHT_LATER = 0.70
+ENV_WEIGHT_LATER = 0.55
+MANUAL_WEIGHT_LATER = 0.45
 
 def sre_rubric_reward(prompts, completions, **kwargs):
     """
-    Hybrid reward function: 70% environment ground-truth + 30% workflow heuristics.
+    Hybrid reward function: principle-based environment signal + workflow heuristics.
     
     Environment provides:
-    - RBAC enforcement, tool discovery bonuses, collaboration rewards, task completion
+    - RBAC, tool use, task completion, and state-transition rewards
+    - Rewards for new evidence, confidence gain, fixability classification, and correct remediation timing
     
     Manual heuristics provide:
     - Context-aware workflow guidance (initial alert vs after investigation)
@@ -377,7 +377,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 manual_reward -= 0.10
         
         # =====================================================================
-        # STAGE 8: Environment execution (70% of total reward)
+        # STAGE 8: Environment execution with principle-based state reward
         # =====================================================================
         try:
             action_dict["agent_id"] = role
@@ -400,7 +400,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             action = Action(**action_dict)
             _, reward_obj, done, _ = env.step(action)
             
-            # Use the canonical env reward (already capped to [-1, 1] per OpenEnv spec)
+            # Use the canonical env reward, including principle-based state transitions.
             env_reward = float(reward_obj.value)
             
             # Task completion is a strong env signal
@@ -421,7 +421,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         ])
         
         if is_later_stage:
-            # Later-stage: Trust manual heuristics more (env state doesn't match prompt context)
+            # Later-stage: env replay now reconstructs evidence/fix state, so trust
+            # the principle-based environment signal slightly more than manual rules.
             total_reward = (env_reward * ENV_WEIGHT_LATER) + (manual_reward * MANUAL_WEIGHT_LATER)
         else:
             # Early-stage: Trust env more (fresh env matches INITIAL ALERT context)
@@ -479,6 +480,14 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             and any(kw in prompt_lower for kw in ["expired tls certificate", "expired upstream certificate", "no local fix"])):
         replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
     
+    # Later prompts may mention only the L2 fix. Recreate the diagnosis first so
+    # principle rewards know the remediation was evidence-backed, not premature.
+    later_fix_context = any(kw in prompt_lower for kw in ["new message from ic", "new message from l2_db_sme", "obs:", "root cause", "fix applied"])
+    if later_fix_context and "payment-db" in prompt_lower and any(kw in prompt_lower for kw in ["restarted", "restart", "fix applied", "recovered"]):
+        replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
+    if later_fix_context and "auth-api" in prompt_lower and any(kw in prompt_lower for kw in ["scaled", "scale", "fix applied", "cpu saturation", "root cause is auth-api"]):
+        replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+
     # Replay RESTART if prompt says service was restarted (L2_DB_SME is authorized)
     if "restarted" in prompt_lower or ("fix applied" in prompt_lower and "payment-db" in prompt_lower):
         if "payment-db" in prompt_lower:
