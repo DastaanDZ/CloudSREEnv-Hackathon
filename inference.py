@@ -90,7 +90,9 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
             **inputs, 
             max_new_tokens=128, 
             pad_token_id=tokenizer.eos_token_id,
-            do_sample=False
+            do_sample=True,             # <-- CHANGED: Allow the model to explore
+            temperature=0.3,            # <-- NEW: Just enough creativity to break loops
+            repetition_penalty=1.1      # <-- NEW: Punishes the model for repeating exact phrases
         )
     
     # Extract only the newly generated tokens
