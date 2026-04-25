@@ -184,6 +184,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         ])
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
+        is_blocked_duplicate = "[blocked] duplicate action" in prompt_lower or "you already did this" in prompt_lower
         
         # --- IC Workflow ---
         if role == "IC":
@@ -206,8 +207,12 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 elif has_fixable_l1_evidence:
                     if target == "L2_DB_SME":
                         manual_reward += 0.70
+                        if is_blocked_duplicate:
+                            manual_reward += 0.35
                     elif target == "L1_Triage":
                         manual_reward -= 0.60
+                        if is_blocked_duplicate:
+                            manual_reward -= 0.30
                     else:
                         manual_reward -= 0.20
                 elif is_after_investigation:
@@ -260,6 +265,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
                     manual_reward -= 0.40
+                    if is_blocked_duplicate:
+                        manual_reward -= 0.20
                 elif has_service_list:
                     manual_reward -= 0.25
                     if is_login_context:
@@ -273,6 +280,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 service_id = action_dict.get("service_id", "")
                 if has_log_content or has_reported:
                     manual_reward -= 0.60
+                    if is_blocked_duplicate:
+                        manual_reward -= 0.35
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
@@ -289,6 +298,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
                     manual_reward += 0.85
+                    if is_blocked_duplicate:
+                        manual_reward += 0.45
                 elif has_reported:
                     # Already reported - don't message again
                     manual_reward -= 0.35
@@ -313,6 +324,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
                     manual_reward -= 0.45
+                    if is_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
@@ -330,6 +343,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 
                 if fix_already_applied:
                     manual_reward -= 0.45
+                    if is_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
                         manual_reward += 0.45
@@ -348,6 +363,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 target = action_dict.get("target", "")
                 if fix_already_applied and target == "IC":
                     manual_reward += 0.50
+                    if is_blocked_duplicate:
+                        manual_reward += 0.35
                 elif not fix_already_applied:
                     manual_reward -= 0.20
                 else:
@@ -610,11 +627,28 @@ def generate_transition_focus_prompts(num_samples: int = 80):
         ),
         (
             "L1_Triage",
+            "New message from IC: Investigate login failures in the authentication flow.\n"
+            "Obs: === Logs: auth-api ===\n"
+            "[ERROR] TLS handshake failed: certificate has expired\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not call GET_LOGS again. Report the certificate RCA to IC now.",
+        ),
+        (
+            "L1_Triage",
             "New message from IC: Investigate payment-db Error.\n"
             "Obs: === Logs: payment-db ===\n"
             "[ERROR] OOMKilled\n"
             "[ERROR] CrashLoopBackOff\n"
             "You already have payment-db logs. Report root cause to IC now.",
+        ),
+        (
+            "L1_Triage",
+            "New message from IC: Investigate payment-db Error.\n"
+            "Obs: === Logs: payment-db ===\n"
+            "[ERROR] OOMKilled\n"
+            "[ERROR] CrashLoopBackOff\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not call GET_LOGS again. Report payment-db root cause to IC now.",
         ),
         (
             "L1_Triage",
@@ -624,6 +658,14 @@ def generate_transition_focus_prompts(num_samples: int = 80):
             "You already have auth-api logs. Report root cause to IC now.",
         ),
         (
+            "L1_Triage",
+            "New message from IC: Investigate high latency on auth-api.\n"
+            "Obs: === Logs: auth-api ===\n"
+            "[WARN] RPS=3500 - CPU usage 99.8%\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not call GET_LOGS again. Report auth-api CPU saturation to IC now.",
+        ),
+        (
             "L2_DB_SME",
             "New message from IC: Restart payment-db to recover from CrashLoopBackOff.\n"
             "Obs: [OK] payment-db restarted by L2_DB_SME.\n"
@@ -631,9 +673,23 @@ def generate_transition_focus_prompts(num_samples: int = 80):
         ),
         (
             "L2_DB_SME",
+            "New message from IC: Restart payment-db to recover from CrashLoopBackOff.\n"
+            "Obs: [OK] payment-db restarted by L2_DB_SME.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not restart again. Report completion to IC now.",
+        ),
+        (
+            "L2_DB_SME",
             "New message from IC: Scale auth-api to 2048 CPU to resolve latency.\n"
             "Obs: [OK] auth-api scaled to 2048m CPU.\n"
             "Fix already applied. Report completion to IC now.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Scale auth-api to 2048 CPU to resolve latency.\n"
+            "Obs: [OK] auth-api scaled to 2048m CPU.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not scale again. Report completion to IC now.",
         ),
         (
             "IC",
@@ -649,6 +705,13 @@ def generate_transition_focus_prompts(num_samples: int = 80):
         ),
         (
             "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\n"
+            "New message from L1_Triage: payment-db logs show OOMKilled and CrashLoopBackOff.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not ask L1 again. Delegate restart to L2_DB_SME now.",
+        ),
+        (
+            "IC",
             "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\n"
             "New message from L1_Triage: Root cause is auth-api CPU saturation under high RPS. auth-api needs scaling.\n"
             "L1 has already reported the root cause. Delegate remediation to L2_DB_SME now.",
@@ -658,6 +721,13 @@ def generate_transition_focus_prompts(num_samples: int = 80):
             "INITIAL ALERT:\n[SYSTEM ALERT] High latency detected on auth-api.\n"
             "New message from L1_Triage: auth-api logs show RPS=3500 and CPU usage 99.8%.\n"
             "Do not ask L1 again. Send scaling instructions to L2_DB_SME.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\n"
+            "New message from L1_Triage: auth-api logs show RPS=3500 and CPU usage 99.8%.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not ask L1 again. Delegate scaling to L2_DB_SME now.",
         ),
         (
             "IC",
@@ -691,9 +761,9 @@ def build_dataset(num_samples: int = 800):
     
     roles = list(PROMPTS.keys())
     
-    # Part 1: Static scenario messages (45% of dataset)
-    focus_samples = int(num_samples * 0.10)
-    static_samples = int(num_samples * 0.45)
+    # Part 1: Static scenario messages (40% of dataset)
+    focus_samples = int(num_samples * 0.20)
+    static_samples = int(num_samples * 0.40)
     for _ in range(static_samples):
         role_key = roles[torch.randint(0, len(roles), (1,)).item()]
         messages_for_role = SCENARIO_MESSAGES[role_key]
@@ -711,7 +781,7 @@ def build_dataset(num_samples: int = 800):
         )
         prompts_list.append(prompt_str)
     
-    # Part 2: Synthetic trajectories (45% of dataset)
+    # Part 2: Synthetic trajectories (40% of dataset)
     trajectory_samples = num_samples - static_samples - focus_samples
     num_episodes = max(1, (trajectory_samples + 5) // 6)  # Generate enough turns, then slice to target.
     trajectories = generate_synthetic_trajectories(num_episodes)
@@ -730,7 +800,7 @@ def build_dataset(num_samples: int = 800):
         )
         prompts_list.append(prompt_str)
 
-    # Part 3: Focused transition prompts (10% of dataset)
+    # Part 3: Focused transition prompts (20% of dataset)
     focus_prompts = generate_transition_focus_prompts(focus_samples)
     for role_key, user_msg in focus_prompts:
         messages = [
