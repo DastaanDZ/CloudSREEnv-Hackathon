@@ -761,16 +761,16 @@ def main():
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
         learning_rate=3e-5,           # Moderate LR for stable convergence
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=2,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
         num_generations=8,            # A100 can sample more candidates per prompt.
-        generation_batch_size=8,
+        generation_batch_size=16,
         logging_steps=10,
         max_steps=300,                # More steps while keeping wall-clock reasonable on A100.
         report_to="none",
         bf16=torch.cuda.is_available(),
         fp16=False,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,  # Faster on A100 when VRAM headroom is available.
         max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
         temperature=0.9,              # Higher temp for more diverse exploration
     )
