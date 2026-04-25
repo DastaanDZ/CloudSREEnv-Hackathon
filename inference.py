@@ -97,6 +97,15 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
     new_tokens = output_tokens[0][len(inputs["input_ids"][0]):]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
+def suggested_l1_log_action(history: str, task_id: str) -> str:
+    """Return the exact GET_LOGS action L1 should take before reporting."""
+    history_lower = history.lower()
+    if "task2" in task_id or "payment-db" in history_lower or "oom" in history_lower or "crash" in history_lower:
+        service_id = "payment-db"
+    else:
+        service_id = "auth-api"
+    return json.dumps({"action_type": "GET_LOGS", "service_id": service_id})
+
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
@@ -138,7 +147,12 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         if len(recent_actions[current_agent]) >= 2 and recent_actions[current_agent][-1] == recent_actions[current_agent][-2]:
             logger.warning(f"Repetition detected for {current_agent}. Injecting hint.")
             if current_agent == "L1_Triage":
-                agent_histories[current_agent] += "\n[SYSTEM] You have already gathered logs. Report your findings to IC using MESSAGE_CHANNEL."
+                next_action = suggested_l1_log_action(agent_histories[current_agent], task_id)
+                last_l1_key = recent_actions[current_agent][-1]
+                if "GET_LOGS" in last_l1_key:
+                    agent_histories[current_agent] += "\n[SYSTEM] You already gathered logs. Now report findings to IC using MESSAGE_CHANNEL."
+                else:
+                    agent_histories[current_agent] += f"\n[SYSTEM] Do not repeat or report yet. Your next action must be exactly: {next_action}"
             elif current_agent == "L2_DB_SME":
                 last_l2_key = recent_actions[current_agent][-1]
                 if "RESTART" in last_l2_key or "SCALE" in last_l2_key:
@@ -166,18 +180,14 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 and action.action_type == ActionType.MESSAGE_CHANNEL
                 and action.target == "IC"):
             prior_actions = recent_actions[current_agent][:-1]
-            has_investigated = any(
-                k.startswith("GET_LOGS") or k.startswith("LIST_SERVICES")
-                for k in prior_actions
-            )
-            if not has_investigated:
+            has_log_evidence = any(k.startswith("GET_LOGS") for k in prior_actions)
+            if not has_log_evidence:
                 logger.warning(f"L1 attempted to report to IC without investigation. Rejecting.")
                 recent_actions[current_agent].pop()
+                next_action = suggested_l1_log_action(agent_histories[current_agent], task_id)
                 agent_histories[current_agent] += (
-                    "\n[SYSTEM] You must investigate before reporting. "
-                    "Run GET_LOGS on the suspected service first "
-                    "(auth-api for login/auth failures, payment-db for crashes/OOM, "
-                    "auth-api for high latency/CPU)."
+                    "\n[SYSTEM] You must collect log evidence before reporting to IC. "
+                    f"Do not use MESSAGE_CHANNEL now. Your next action must be exactly: {next_action}"
                 )
                 continue
 

@@ -147,7 +147,11 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # Detect context phases
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
         is_after_investigation = any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
-        is_after_fix = any(kw in prompt_lower for kw in ["l2_db_sme confirms", "l2_db_sme reports", "all services now healthy", "fix successfully", "restarted and is now", "scaled to"])
+        is_after_fix = any(kw in prompt_lower for kw in [
+            "l2_db_sme confirms", "l2_db_sme reports", "new message from l2_db_sme",
+            "all services now healthy", "fix successfully", "fix applied",
+            "restarted and is now", "restarted.", "scaled to"
+        ])
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
         
@@ -156,32 +160,40 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             if action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
                 
-                if is_initial_alert:
+                # Phase priority matters because every IC history keeps the
+                # original INITIAL ALERT. Later-state evidence must win.
+                if is_after_fix:
+                    manual_reward -= 0.65
+                    if target == "L2_DB_SME":
+                        manual_reward -= 0.20
+                elif is_after_investigation:
+                    if is_investigation_only:
+                        if target == "L2_DB_SME":
+                            manual_reward -= 0.45
+                        else:
+                            manual_reward -= 0.10
+                    else:
+                        if target == "L2_DB_SME":
+                            manual_reward += 0.55
+                        elif target == "L1_Triage":
+                            manual_reward -= 0.35
+                        else:
+                            manual_reward -= 0.10
+                elif is_initial_alert:
                     if target == "L1_Triage":
                         manual_reward += 0.50
                     elif target == "L2_DB_SME":
                         manual_reward += 0.15
                     else:
                         manual_reward -= 0.10
-                elif is_after_investigation:
-                    if is_investigation_only:
-                        if target == "L2_DB_SME":
-                            manual_reward -= 0.30
-                        else:
-                            manual_reward += 0.10
-                    else:
-                        if target == "L2_DB_SME":
-                            manual_reward += 0.50
-                        elif target == "L1_Triage":
-                            manual_reward -= 0.15
                 else:
                     manual_reward += 0.20
                         
             elif action_type == "CLOSE_INCIDENT":
                 if is_after_fix:
-                    manual_reward += 0.45
+                    manual_reward += 0.85
                 elif is_after_investigation and is_investigation_only:
-                    manual_reward += 0.45
+                    manual_reward += 0.75
                 elif is_initial_alert:
                     manual_reward -= 0.60
                 elif is_after_investigation:
@@ -236,15 +248,15 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 target = action_dict.get("target", "")
                 if has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
-                    manual_reward += 0.70
+                    manual_reward += 0.85
                 elif has_reported:
                     # Already reported - don't message again
-                    manual_reward -= 0.20
-                elif not has_service_list and not has_log_content:
+                    manual_reward -= 0.35
+                elif not has_log_content:
                     # Haven't investigated at all - L1 must NEVER report without evidence
-                    manual_reward -= 0.40
+                    manual_reward -= 0.75
                 else:
-                    manual_reward += 0.10
+                    manual_reward -= 0.20
                     
             elif action_type == "CLOSE_INCIDENT":
                 manual_reward -= 0.60
@@ -407,6 +419,16 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             except Exception:
                 pass
     
+    # IC only sees L1's RCA report, not the raw L1 action history. Recreate the
+    # required task1 evidence so CLOSE_INCIDENT is scored like inference.
+    if ("new message from l1_triage" in prompt_lower
+            and "auth-api" in prompt_lower
+            and any(kw in prompt_lower for kw in ["expired tls certificate", "expired upstream certificate", "no local fix"])):
+        try:
+            env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+        except Exception:
+            pass
+    
     # Replay RESTART if prompt says service was restarted (L2_DB_SME is authorized)
     if "restarted" in prompt_lower:
         if "payment-db" in prompt_lower:
@@ -449,10 +471,11 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
     """
     trajectories = []
     
-    for _ in range(num_episodes):
+    tasks = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"]
+    for episode_idx in range(num_episodes):
         env = CloudSREEnv()
-        # Randomly pick a task
-        task = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"][torch.randint(0, 3, (1,)).item()]
+        # Round-robin tasks so every training build gets balanced coverage.
+        task = tasks[episode_idx % len(tasks)]
         obs = env.reset(task_id=task)
         
         # Simulate expert trajectory
@@ -491,24 +514,34 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             trajectories.append(("IC", agent_histories["IC"]))
         else:
             # Task2/Task3: full remediation workflow via L2
-            finding = f"Root cause: {target_svc} issue found in logs."
+            if "task2" in task:
+                finding = "Root cause: payment-db is in CrashLoopBackOff with OOMKilled errors. It needs RESTART."
+            else:
+                finding = "Root cause: auth-api CPU is saturated under high RPS, causing latency. It needs SCALE to 2048 CPU."
             agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
             
             # Turn 5: IC delegates to L2
             trajectories.append(("IC", agent_histories["IC"]))
-            agent_histories["L2_DB_SME"] = f"New message from IC: Fix {target_svc}. Apply RESTART or SCALE as needed."
+            if "task2" in task:
+                agent_histories["L2_DB_SME"] = "New message from IC: Restart payment-db to recover from CrashLoopBackOff."
+            else:
+                agent_histories["L2_DB_SME"] = "New message from IC: Scale auth-api to 2048 CPU to resolve latency."
             
             # Turn 6: L2 applies fix
             trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
             if "task3" in task:
-                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
+                fix_obs, _, _, _ = env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
                 fix_msg = f"{target_svc} scaled to 2048 CPU."
             else:
-                env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
+                fix_obs, _, _, _ = env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
                 fix_msg = f"{target_svc} restarted."
+            agent_histories["L2_DB_SME"] += f"\nObs: {fix_obs.text_output}"
+            
+            # Turn 7: L2 reports completion to IC
+            trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
             agent_histories["IC"] += f"\nNew message from L2_DB_SME: Fix applied. {fix_msg}"
             
-            # Turn 7: IC closes incident
+            # Turn 8: IC closes incident
             trajectories.append(("IC", agent_histories["IC"]))
     
     return trajectories
@@ -546,7 +579,7 @@ def build_dataset(num_samples: int = 800):
     
     # Part 2: Synthetic trajectories (40% of dataset)
     trajectory_samples = num_samples - static_samples
-    num_episodes = trajectory_samples // 7  # ~7 turns per episode
+    num_episodes = max(1, (trajectory_samples + 5) // 6)  # Generate enough turns, then slice to target.
     trajectories = generate_synthetic_trajectories(num_episodes)
     
     for role_key, user_msg in trajectories[:trajectory_samples]:
