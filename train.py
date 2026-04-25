@@ -683,15 +683,15 @@ def main():
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
         learning_rate=3e-5,           # Moderate LR for stable convergence
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_generations=6,            # More generations for better variance
-        generation_batch_size=6, 
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
+        num_generations=4,            # Lower generation count speeds up GRPO on larger GPUs
+        generation_batch_size=32,
         logging_steps=10,
         max_steps=200,                # More steps for workflow learning
         report_to="none",
         fp16=True, 
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
         temperature=0.9,              # Higher temp for more diverse exploration
     )
