@@ -1,5 +1,5 @@
 """
-train.py — Hugging Face TRL GRPO Training Loop for CloudSREEnv (Colab T4 Optimized)
+train.py — Hugging Face TRL GRPO Training Loop for CloudSREEnv (Colab A100 Optimized)
 """
 
 import json
@@ -36,6 +36,11 @@ def extract_first_json_object(raw_text: str) -> tuple[dict | None, int]:
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
+
+if torch.cuda.is_available():
+    # A100 supports TF32/BF16 well; this speeds up matmul-heavy training.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("GRPOTrainer")
@@ -735,10 +740,11 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load the model in 16-bit float to save VRAM on T4
+    # A100 handles BF16 efficiently and SDPA avoids an extra flash-attn install.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        attn_implementation="sdpa",
     ).to(DEVICE)
     
     # Build diverse training dataset
@@ -755,14 +761,15 @@ def main():
     training_args = GRPOConfig(
         output_dir="./grpo_sre_model",
         learning_rate=3e-5,           # Moderate LR for stable convergence
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_generations=6,            # More generations for better variance
-        generation_batch_size=6, 
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=2,
+        num_generations=8,            # A100 can sample more candidates per prompt.
+        generation_batch_size=8,
         logging_steps=10,
-        max_steps=200,                # More steps for workflow learning
+        max_steps=300,                # More steps while keeping wall-clock reasonable on A100.
         report_to="none",
-        fp16=True, 
+        bf16=torch.cuda.is_available(),
+        fp16=False,
         gradient_checkpointing=True,
         max_completion_length=80,     # Slightly longer for MESSAGE_CHANNEL with content
         temperature=0.9,              # Higher temp for more diverse exploration
