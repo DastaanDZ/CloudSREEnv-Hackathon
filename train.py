@@ -31,7 +31,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
     env = CloudSREEnv()
     
     for prompt_str, completion in zip(prompts, completions):
-        # Identify role based on keywords in the formatted prompt string
+        # Determine role from the prompt string keywords
         if "Incident Commander" in prompt_str:
             current_role = "IC"
         elif "L2 Database SME" in prompt_str:
@@ -39,16 +39,18 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         else:
             current_role = "L1_Triage"
         
+        # Completion can be a list or string depending on TRL version
         raw_text = completion[0]['content'] if isinstance(completion, list) else completion
         
-        # --- FORMATTING RUBRIC ---
+        # --- COMPOSABLE RUBRIC: FORMATTING ---
+        # Reward the model for being concise and using JSON syntax
         format_reward = 0.2 if raw_text.strip().startswith("{") and raw_text.strip().endswith("}") else -0.3
             
         # --- ENVIRONMENT RUBRIC ---
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         clean_json = match.group(0) if match else "{}"
         
-        # Set scenario based on role [cite: 5, 37]
+        # Setup specific scenario for the role
         env.reset(task_id="task1_status_audit" if current_role != "L2_DB_SME" else "task2_self_healing")
         
         try:
@@ -60,7 +62,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             
         _, reward_obj, _, _ = env.step(action)
         
-        # Composable reward: Format Adherence + Environment Success [cite: 92]
+        # Total Reward = Format + Task Success
         rewards.append(format_reward + float(reward_obj.value))
 
     return rewards
@@ -68,29 +70,33 @@ def sre_rubric_reward(prompts, completions, **kwargs):
 # 2. Multi-Role Dataset
 # ---------------------------------------------------------------------------
 def build_dataset():
-    """Builds a dataset that shuffles between IC, L1, and L2 roles with chat templates."""
+    """Builds a dataset that shuffles roles and applies chat templates properly."""
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    data = []
+    # Use a simple list to store the final string prompts
+    prompts_list = []
+    
     roles = [
         ("IC", "INITIAL ALERT: payment-db in Error"), 
         ("L1_Triage", "IC Message: Audit the database"), 
         ("L2_DB_SME", "IC Message: Fix payment-db")
     ]
              
-    for _ in range(100):
-        role, msg = roles[torch.randint(0, len(roles), (1,)).item()]
+    for _ in range(100): 
+        # Randomly select a role for this training example
+        role_key, msg = roles[torch.randint(0, len(roles), (1,)).item()]
         
         messages = [
-            {"role": "system", "content": PROMPTS[role]},
+            {"role": "system", "content": PROMPTS[role_key]},
             {"role": "user", "content": msg}
         ]
         
-        # Apply the chat template to create a single string prompt
+        # Convert the chat list into a single formatted string for Llama 3
         prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
-        data.append({"prompt": prompt_str})
+        # Append the STRING, not a dictionary
+        prompts_list.append(prompt_str)
         
-    return Dataset.from_dict({"prompt": data})
+    return Dataset.from_dict({"prompt": prompts_list})
 
 # ---------------------------------------------------------------------------
 # 3. The Main Training Loop
