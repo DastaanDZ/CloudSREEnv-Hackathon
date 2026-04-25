@@ -205,9 +205,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         manual_reward -= 0.20
                 elif has_fixable_l1_evidence:
                     if target == "L2_DB_SME":
-                        manual_reward += 0.65
+                        manual_reward += 0.70
                     elif target == "L1_Triage":
-                        manual_reward -= 0.50
+                        manual_reward -= 0.60
                     else:
                         manual_reward -= 0.20
                 elif is_after_investigation:
@@ -272,7 +272,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if has_log_content or has_reported:
-                    manual_reward -= 0.40
+                    manual_reward -= 0.50
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
@@ -312,7 +312,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.35
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
@@ -329,7 +329,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 cpu_value = action_dict.get("cpu_value")
                 
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.35
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
                         manual_reward += 0.45
