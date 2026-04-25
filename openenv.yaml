@@ -48,10 +48,25 @@ tasks:
     max_steps: 20
     scenario: performance_bottleneck
 
+  - id: task4_resource_contention
+    name: "Noisy Neighbor Resource Contention"
+    difficulty: hard
+    description: >
+      Diagnose checkout latency where notification-worker has a memory leak and
+      consumes 8000MB RAM, creating node memory pressure that throttles payment-db.
+      The agent must avoid scaling the symptom service and fix the noisy neighbor.
+    success_criteria: >
+      Final score 1.00: Agent applies UPDATE_CONFIG to notification-worker with
+      memory_limit_mb <= 2048, reducing memory pressure and restoring payment-db latency.
+    max_steps: 20
+    scenario: resource_contention
+
 reward_shaping:
   useful_diagnostic: +0.1
   hallucinated_service: -0.2
   unnecessary_restart: -0.5
+  wrong_root_cause_scale: -0.35 # Discourages scaling payment-db in task4
+  config_fix_bonus: +0.45      # Rewards constraining noisy-neighbor memory
   step_penalty: -0.02         # Encourages resolution speed
   cost_penalty: -0.1          # Discourages over-provisioning (>4000m CPU)
   task_completion_bonus: +0.9 # Final non-binary success signal

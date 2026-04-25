@@ -22,6 +22,7 @@ class ActionType(str, Enum):
     GET_LOGS = "GET_LOGS"
     RESTART = "RESTART"
     SCALE = "SCALE"
+    UPDATE_CONFIG = "UPDATE_CONFIG"
     MESSAGE_CHANNEL = "MESSAGE_CHANNEL"
     CLOSE_INCIDENT = "CLOSE_INCIDENT"
     INVALID_FORMAT = "INVALID_FORMAT" # NEW: For RL Syntax Penalties
@@ -31,6 +32,7 @@ class Action(BaseModel):
     agent_id: str = "SYSTEM"
     service_id: Optional[str] = None
     cpu_value: Optional[int] = None
+    memory_limit_mb: Optional[int] = None
     target: Optional[str] = None
     message: Optional[str] = None
 
@@ -42,6 +44,7 @@ class ServiceMetrics(BaseModel):
     cpu_allocated: int
     memory_allocated: int
     latency_ms: int
+    memory_limit_mb: Optional[int] = None
 
 class Observation(BaseModel):
     text_output: str
@@ -62,6 +65,7 @@ class Service:
         self.status = status
         self.cpu_allocated = cpu
         self.memory_allocated = mem
+        self.memory_limit_mb: Optional[int] = None
         self.latency_ms = lat
         self.logs: List[str] = []
         self.error_message: str = ""
@@ -70,12 +74,15 @@ class Service:
     def metrics(self) -> ServiceMetrics:
         return ServiceMetrics(
             id=self.id, status=self.status, cpu_allocated=self.cpu_allocated,
-            memory_allocated=self.memory_allocated, latency_ms=self.latency_ms
+            memory_allocated=self.memory_allocated, latency_ms=self.latency_ms,
+            memory_limit_mb=self.memory_limit_mb
         )
 
 class MockCloud:
     RPS_NORMAL = 500
     RPS_HIGH = 3500
+    WORKER_MEMORY_PRESSURE_MB = 7000
+    STRICT_WORKER_MEMORY_LIMIT_MB = 2048
 
     def __init__(self):
         self.services: Dict[str, Service] = {}
@@ -98,6 +105,8 @@ class MockCloud:
             self._apply_performance_bottleneck()
         elif scenario == "tls_certificate_expiry":
             self._apply_tls_certificate_expiry()
+        elif scenario == "resource_contention":
+            self._apply_resource_contention()
 
         self._propagate_failures()
 
@@ -128,6 +137,44 @@ class MockCloud:
         ]
         self.incident_channel.append("[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.")
 
+    def _apply_resource_contention(self):
+        worker = self.services["notification-worker"]
+        worker.memory_allocated = 8000
+        worker.latency_ms = 180
+        worker.logs = [
+            "[WARN] Heap growth detected: notification batch cache at 8000MB",
+            "[WARN] Node memory pressure: worker has no memory limit"
+        ]
+
+        db = self.services["payment-db"]
+        db.latency_ms = 650
+        db.logs = [
+            "[WARN] Checkout queries throttled by node memory pressure",
+            "[INFO] Database CPU is normal; memory reclaim stalls detected"
+        ]
+        self.incident_channel.append("[SYSTEM ALERT] Checkout latency detected on payment-db.")
+
+    def _has_worker_memory_pressure(self) -> bool:
+        worker = self.services.get("notification-worker")
+        if not worker:
+            return False
+        has_strict_limit = (
+            worker.memory_limit_mb is not None
+            and worker.memory_limit_mb <= self.STRICT_WORKER_MEMORY_LIMIT_MB
+        )
+        return worker.memory_allocated >= self.WORKER_MEMORY_PRESSURE_MB and not has_strict_limit
+
+    def apply_worker_memory_limit(self, limit_mb: int) -> None:
+        worker = self.services["notification-worker"]
+        worker.memory_limit_mb = limit_mb
+        if limit_mb <= self.STRICT_WORKER_MEMORY_LIMIT_MB:
+            worker.memory_allocated = min(worker.memory_allocated, limit_mb)
+            worker.latency_ms = 60
+            worker.logs = [f"[INFO] Memory limit set to {limit_mb}MB; cache trimmed."]
+        else:
+            worker.logs = [f"[WARN] Memory limit set to {limit_mb}MB; still too high for node pressure."]
+        self._propagate_failures()
+
     def _propagate_failures(self):
         deps = {
             "auth-api": "payment-db",
@@ -140,6 +187,11 @@ class MockCloud:
             svc.error_message = ""
             if svc.status == "Running" and svc.id != "auth-api":
                 svc.latency_ms = 45 if svc.id != "payment-db" else 12
+
+        if self._has_worker_memory_pressure():
+            db = self.services["payment-db"]
+            db.latency_ms = 650
+            db.error_message = "Warning: throttled by node memory pressure from notification-worker."
 
         for dependent, provider_id in deps.items():
             provider = self.services.get(provider_id)
@@ -179,6 +231,8 @@ class CloudSREEnv:
             self.cloud.reset(scenario="crash_loop")
         elif "task3" in self.current_task:
             self.cloud.reset(scenario="performance_bottleneck")
+        elif "task4" in self.current_task:
+            self.cloud.reset(scenario="resource_contention")
         else:
             self.cloud.reset(scenario=scenario or "healthy")
 
@@ -192,6 +246,7 @@ class CloudSREEnv:
 
         self.action_history.append(action)
         obs_text = ""
+        structured_data: List[ServiceMetrics] = []
 
         # --- HARD DUPLICATE BLOCK ---
         # Reject any repeat of an action already taken this episode (per-type key).
@@ -224,7 +279,12 @@ class CloudSREEnv:
 
         # --- EXECUTE ACTIONS ---
         if action.action_type == ActionType.LIST_SERVICES:
-            lines = [f"{svc.id:<20} {svc.status:<10} {svc.latency_ms}ms" for svc in self.cloud.services.values()]
+            structured_data = [svc.metrics for svc in self.cloud.services.values()]
+            lines = [
+                f"{svc.id:<20} {svc.status:<10} CPU={svc.cpu_allocated}m "
+                f"MEM={svc.memory_allocated}MB LAT={svc.latency_ms}ms"
+                for svc in self.cloud.services.values()
+            ]
             obs_text = "\n".join(lines)
 
         elif action.action_type == ActionType.GET_LOGS:
@@ -262,6 +322,29 @@ class CloudSREEnv:
                         self.cloud._propagate_failures()
                     obs_text = f"[OK] {action.service_id} scaled to {action.cpu_value}m CPU."
 
+                    if "task4" in self.current_task and action.service_id == "payment-db":
+                        total_reward -= 0.4
+                        breakdown["wrong_root_cause_penalty"] = -0.4
+                        obs_text += " [WARN] Latency persists; DB was not the root cause."
+
+        elif action.action_type == ActionType.UPDATE_CONFIG:
+            if action.memory_limit_mb is None:
+                obs_text = "[ERROR] UPDATE_CONFIG requires memory_limit_mb parameter."
+                total_reward -= 0.2
+                breakdown["missing_param_penalty"] = -0.2
+            else:
+                svc = self.cloud.services.get(action.service_id)
+                if not svc:
+                    obs_text = f"[ERROR] Service {action.service_id} not found."
+                    total_reward -= 0.1
+                else:
+                    svc.memory_limit_mb = action.memory_limit_mb
+                    if action.service_id == "notification-worker":
+                        self.cloud.apply_worker_memory_limit(action.memory_limit_mb)
+                    else:
+                        self.cloud._propagate_failures()
+                    obs_text = f"[OK] {action.service_id} memory limit set to {action.memory_limit_mb}MB."
+
         elif action.action_type == ActionType.MESSAGE_CHANNEL:
             msg = f"[{action.agent_id} -> {action.target}]: {action.message}"
             self.cloud.incident_channel.append(msg)
@@ -282,7 +365,7 @@ class CloudSREEnv:
         # Cap the reward between -1.0 and 1.0 to comply with OpenEnv Spec
         capped_reward = max(-1.0, min(1.0, total_reward))
         
-        return Observation(text_output=obs_text), Reward(value=capped_reward, reason=reason, breakdown=breakdown), self.done, {}
+        return Observation(text_output=obs_text, structured_data=structured_data), Reward(value=capped_reward, reason=reason, breakdown=breakdown), self.done, {}
 
     def _action_match_key(self, action: Action) -> tuple:
         """Per-type identity used for hard-duplicate detection.
@@ -290,10 +373,13 @@ class CloudSREEnv:
         - LIST_SERVICES: (type, agent)
         - GET_LOGS / RESTART: (type, agent, service)
         - SCALE: (type, agent, service, cpu_value)  -- different cpu_value is allowed
+        - UPDATE_CONFIG: (type, agent, service, memory_limit_mb)
         - MESSAGE_CHANNEL: (type, agent, target)    -- message text intentionally ignored
         """
         if action.action_type == ActionType.SCALE:
             return (action.action_type, action.agent_id, action.service_id, action.cpu_value)
+        if action.action_type == ActionType.UPDATE_CONFIG:
+            return (action.action_type, action.agent_id, action.service_id, action.memory_limit_mb)
         if action.action_type == ActionType.MESSAGE_CHANNEL:
             return (action.action_type, action.agent_id, action.target)
         if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART):
@@ -334,13 +420,32 @@ class CloudSREEnv:
             reason = "Communicated in channel."
 
         # 3. RBAC Rubric (Strictly enforce roles)
-        if action.action_type in [ActionType.RESTART, ActionType.SCALE]:
+        if action.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG]:
             if action.agent_id != "L2_DB_SME":
                 return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
             else:
                 reward += 0.2
                 breakdown["authorized_action"] = 0.2
                 reason = "Executed authorized modification."
+
+        if "task4" in self.current_task:
+            if action.action_type == ActionType.LIST_SERVICES:
+                reward += 0.15
+                breakdown["memory_discovery"] = 0.15
+                reason = "Inspected resource usage."
+            elif (
+                action.action_type == ActionType.UPDATE_CONFIG
+                and action.service_id == "notification-worker"
+                and action.memory_limit_mb is not None
+                and action.memory_limit_mb <= self.cloud.STRICT_WORKER_MEMORY_LIMIT_MB
+            ):
+                reward += 0.45
+                breakdown["correct_config_fix"] = 0.45
+                reason = "Constrained noisy neighbor memory."
+            elif action.action_type == ActionType.SCALE and action.service_id == "payment-db":
+                reward -= 0.35
+                breakdown["db_scaling_trap"] = -0.35
+                reason = "Scaled symptom service instead of noisy neighbor."
 
         # 4. Time Penalty (Encourages efficiency)
         time_penalty = -0.02 * self.steps_taken
@@ -355,7 +460,10 @@ class CloudSREEnv:
         if "task1" in self.current_task:
             # TLS Certificate RCA: GET_LOGS(auth-api) happened AND no RESTART/SCALE
             found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api" for a in self.action_history)
-            no_remediation = not any(a.action_type in [ActionType.RESTART, ActionType.SCALE] for a in self.action_history)
+            no_remediation = not any(
+                a.action_type in [ActionType.RESTART, ActionType.SCALE, ActionType.UPDATE_CONFIG]
+                for a in self.action_history
+            )
             return (True, 0.8) if (found_logs and no_remediation) else (False, 0.0)
             
         elif "task2" in self.current_task:
@@ -364,6 +472,18 @@ class CloudSREEnv:
         elif "task3" in self.current_task:
             svc = self.cloud.services["auth-api"]
             return (True, 1.0) if svc.cpu_allocated >= 2048 and svc.latency_ms < 100 else (False, 0.0)
+
+        elif "task4" in self.current_task:
+            worker = self.cloud.services["notification-worker"]
+            db = self.cloud.services["payment-db"]
+            config_applied = any(
+                a.action_type == ActionType.UPDATE_CONFIG
+                and a.service_id == "notification-worker"
+                and a.memory_limit_mb is not None
+                and a.memory_limit_mb <= self.cloud.STRICT_WORKER_MEMORY_LIMIT_MB
+                for a in self.action_history
+            )
+            return (True, 1.0) if config_applied and db.latency_ms < 100 and worker.memory_allocated <= 2048 else (False, 0.0)
             
         return False, 0.0
 

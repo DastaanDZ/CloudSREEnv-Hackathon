@@ -55,6 +55,7 @@ Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue a
 | **TLS Certificate RCA** | Easy | Certificate Expiry | Identify expired cert in auth-api logs (no fix needed) |
 | **Self-Healing** | Medium | DB Recovery | Restore DB health to fix entire cluster |
 | **RCA & Scaling** | Hard | Latency Bottleneck | Scale the DB (root cause) to fix worker latency |
+| **Noisy Neighbor** | Hard | Resource Contention | Limit notification-worker memory to restore payment-db latency |
 
 ---
 
@@ -65,6 +66,7 @@ Unlike basic simulators, `CloudSREEnv` implements cascading failures. An issue a
 - `GET_LOGS(service_id)`: Fetches logs (includes cascading error propagation).
 - `RESTART(service_id)`: Restores a crashed pod.
 - `SCALE(service_id, cpu_value)`: Modifies CPU (Success: `cpu >= 2048`).
+- `UPDATE_CONFIG(service_id, memory_limit_mb)`: Applies a memory limit to a service (Task 4 success: `notification-worker <= 2048MB`).
 
 ### Observation Space (Outputs)
 - `text_output`: Human-readable terminal logs and status tables.

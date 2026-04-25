@@ -48,7 +48,7 @@ def seed_everything(seed: int = SEED) -> None:
 
 # Valid services in the environment (for semantic scoring)
 VALID_SERVICES = {"auth-api", "payment-db", "inventory-svc", "notification-worker"}
-VALID_ACTIONS = {"LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "MESSAGE_CHANNEL", "CLOSE_INCIDENT"}
+VALID_ACTIONS = {"LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG", "MESSAGE_CHANNEL", "CLOSE_INCIDENT"}
 VALID_TARGETS = {"IC", "L1_Triage", "L2_DB_SME"}
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,12 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             and "auth-api" in prompt_lower
             and any(kw in prompt_lower for kw in ["cpu", "rps", "latency", "scale", "saturated", "overloaded"])
         )
-        has_fixable_l1_evidence = task2_crash_evidence or task3_perf_evidence
+        task4_contention_evidence = (
+            has_l1_message
+            and "notification-worker" in prompt_lower
+            and any(kw in prompt_lower for kw in ["8000mb", "memory pressure", "noisy neighbor", "starving", "memory limit"])
+        )
+        has_fixable_l1_evidence = task2_crash_evidence or task3_perf_evidence or task4_contention_evidence
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
         is_after_investigation = (
             any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
@@ -180,7 +185,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         is_after_fix = any(kw in prompt_lower for kw in [
             "l2_db_sme confirms", "l2_db_sme reports", "new message from l2_db_sme",
             "all services now healthy", "fix successfully", "fix applied",
-            "restarted and is now", "restarted.", "scaled to"
+            "restarted and is now", "restarted.", "scaled to", "memory limit set", "update_config"
         ])
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
@@ -241,7 +246,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 else:
                     manual_reward -= 0.30
                     
-            elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE"]:
+            elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG"]:
                 manual_reward -= 0.30
         
         # --- L1_Triage Workflow ---
@@ -252,10 +257,14 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             has_service_list = any(kw in prompt_lower for kw in ["running", "error      0ms", "obs:"])
             has_log_content = any(kw in prompt_lower for kw in 
                 ["=== logs:", "[error]", "[warn]", "oomkilled", "crashloopbackoff",
-                 "cpu usage", "rps=", "503 service unavailable"])
+                 "cpu usage", "rps=", "503 service unavailable", "8000mb", "memory pressure"])
             has_reported = any(kw in prompt_lower for kw in 
                 ["found:", "identified", "reports:", "root cause", "report findings"])
             is_login_context = any(kw in prompt_lower for kw in ["login failure", "authentication failure", "authentication flow"])
+            is_resource_contention_context = (
+                "notification-worker" in prompt_lower
+                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "payment-db"])
+            )
             
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
@@ -268,6 +277,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
                         manual_reward += 0.15
+                    if "payment-db" in prompt_lower and "latency" in prompt_lower:
+                        manual_reward += 0.10
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
@@ -279,6 +290,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         manual_reward += 0.20
                     if is_login_context and service_id == "auth-api":
                         manual_reward += 0.25
+                    if is_resource_contention_context and service_id == "notification-worker":
+                        manual_reward += 0.30
                 elif service_id:
                     manual_reward -= 0.15
                 else:
@@ -301,13 +314,17 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "CLOSE_INCIDENT":
                 manual_reward -= 0.60
                 
-            elif action_type in ["RESTART", "SCALE"]:
+            elif action_type in ["RESTART", "SCALE", "UPDATE_CONFIG"]:
                 manual_reward -= 0.50
         
         # --- L2_DB_SME Workflow ---
         elif role == "L2_DB_SME":
             fix_already_applied = any(kw in prompt_lower for kw in 
-                ["restarted", "scaled", "fix applied", "recovered", "back online"])
+                ["restarted", "scaled", "fix applied", "recovered", "back online", "memory limit set"])
+            is_resource_contention_context = (
+                "notification-worker" in prompt_lower
+                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db"])
+            )
             
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
@@ -331,6 +348,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if fix_already_applied:
                     manual_reward -= 0.25
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
+                    if is_resource_contention_context and service_id == "payment-db":
+                        manual_reward -= 0.60
                     if cpu_value >= 2048:
                         manual_reward += 0.45
                     elif cpu_value >= 1024:
@@ -343,6 +362,26 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         manual_reward += 0.15
                 else:
                     manual_reward -= 0.20
+
+            elif action_type == "UPDATE_CONFIG":
+                service_id = action_dict.get("service_id", "")
+                memory_limit_mb = action_dict.get("memory_limit_mb")
+
+                if fix_already_applied:
+                    manual_reward -= 0.25
+                elif service_id == "notification-worker" and isinstance(memory_limit_mb, int):
+                    if memory_limit_mb <= 2048:
+                        manual_reward += 0.75
+                    elif memory_limit_mb <= 4096:
+                        manual_reward += 0.25
+                    else:
+                        manual_reward -= 0.20
+                    if is_resource_contention_context:
+                        manual_reward += 0.35
+                elif service_id in VALID_SERVICES:
+                    manual_reward -= 0.25
+                else:
+                    manual_reward -= 0.30
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
@@ -362,12 +401,16 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # =====================================================================
         # STAGE 7: Field completeness validation (manual)
         # =====================================================================
-        if action_type in ["GET_LOGS", "RESTART", "SCALE"]:
+        if action_type in ["GET_LOGS", "RESTART", "SCALE", "UPDATE_CONFIG"]:
             if not action_dict.get("service_id"):
                 manual_reward -= 0.15
                 
         if action_type == "SCALE":
             if not isinstance(action_dict.get("cpu_value"), int):
+                manual_reward -= 0.15
+
+        if action_type == "UPDATE_CONFIG":
+            if not isinstance(action_dict.get("memory_limit_mb"), int):
                 manual_reward -= 0.15
                 
         if action_type == "MESSAGE_CHANNEL":
@@ -388,6 +431,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 env.reset(task_id="task1_tls_certificate_rca")
             elif "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
                 env.reset(task_id="task2_self_healing")
+            elif any(kw in prompt_lower for kw in ["notification-worker", "8000mb", "noisy neighbor", "memory pressure", "memory limit", "checkout latency"]):
+                env.reset(task_id="task4_resource_contention")
             elif "latency" in prompt_lower or "slow" in prompt_lower or "cpu" in prompt_lower:
                 env.reset(task_id="task3_latency_resolution")
             else:
@@ -463,6 +508,8 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
         if "=== logs: auth-api ===" in prompt_lower:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+        if "=== logs: notification-worker ===" in prompt_lower or "notification-worker" in prompt_lower and "8000mb" in prompt_lower:
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="notification-worker"))
     
     # IC prompts often contain L1 summaries rather than raw logs. Replay the
     # implied read-only evidence so IC routing actions get accurate env scores.
@@ -471,6 +518,8 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
         if "auth-api" in prompt_lower and any(kw in prompt_lower for kw in ["cpu", "rps", "latency", "saturated", "overloaded"]):
             replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+        if "notification-worker" in prompt_lower and any(kw in prompt_lower for kw in ["8000mb", "memory pressure", "noisy neighbor", "starving"]):
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="notification-worker"))
     
     # IC only sees L1's RCA report, not the raw L1 action history. Recreate the
     # required task1 evidence so CLOSE_INCIDENT is scored like inference.
@@ -490,6 +539,16 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
             replay_once(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="auth-api", cpu_value=2048))
         if "payment-db" in prompt_lower:
             replay_once(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="payment-db", cpu_value=4096))
+
+    # Replay UPDATE_CONFIG if prompt says the noisy neighbor memory limit was applied.
+    if "memory limit set" in prompt_lower or "memory_limit_mb" in prompt_lower or "update_config" in prompt_lower:
+        if "notification-worker" in prompt_lower:
+            replay_once(Action(
+                action_type=ActionType.UPDATE_CONFIG,
+                agent_id="L2_DB_SME",
+                service_id="notification-worker",
+                memory_limit_mb=2048,
+            ))
 
 
 def _detect_role_from_prompt(prompt_str: str) -> str:
@@ -512,7 +571,12 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
     """
     trajectories = []
     
-    tasks = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"]
+    tasks = [
+        "task1_tls_certificate_rca",
+        "task2_self_healing",
+        "task3_latency_resolution",
+        "task4_resource_contention",
+    ]
     for episode_idx in range(num_episodes):
         env = CloudSREEnv()
         # Round-robin tasks so every training build gets balanced coverage.
@@ -540,7 +604,12 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         
         # Turn 3: L1 gets logs from problematic service
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
-        target_svc = "payment-db" if "task2" in task else "auth-api"
+        if "task2" in task:
+            target_svc = "payment-db"
+        elif "task4" in task:
+            target_svc = "notification-worker"
+        else:
+            target_svc = "auth-api"
         log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
         agent_histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
         
@@ -554,9 +623,11 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             # Turn 5: IC closes incident (no remediation possible)
             trajectories.append(("IC", agent_histories["IC"]))
         else:
-            # Task2/Task3: full remediation workflow via L2
+            # Task2/Task3/Task4: full remediation workflow via L2
             if "task2" in task:
                 finding = "Root cause: payment-db is in CrashLoopBackOff with OOMKilled errors. It needs RESTART."
+            elif "task4" in task:
+                finding = "Root cause: notification-worker is using 8000MB RAM and starving payment-db. It needs UPDATE_CONFIG memory_limit_mb 2048."
             else:
                 finding = "Root cause: auth-api CPU is saturated under high RPS, causing latency. It needs SCALE to 2048 CPU."
             agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
@@ -565,6 +636,8 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             trajectories.append(("IC", agent_histories["IC"]))
             if "task2" in task:
                 agent_histories["L2_DB_SME"] = "New message from IC: Restart payment-db to recover from CrashLoopBackOff."
+            elif "task4" in task:
+                agent_histories["L2_DB_SME"] = "New message from IC: Set notification-worker memory limit to 2048MB to stop starving payment-db."
             else:
                 agent_histories["L2_DB_SME"] = "New message from IC: Scale auth-api to 2048 CPU to resolve latency."
             
@@ -573,6 +646,14 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             if "task3" in task:
                 fix_obs, _, _, _ = env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
                 fix_msg = f"{target_svc} scaled to 2048 CPU."
+            elif "task4" in task:
+                fix_obs, _, _, _ = env.step(Action(
+                    action_type=ActionType.UPDATE_CONFIG,
+                    agent_id="L2_DB_SME",
+                    service_id=target_svc,
+                    memory_limit_mb=2048,
+                ))
+                fix_msg = f"{target_svc} memory limit set to 2048MB."
             else:
                 fix_obs, _, _, _ = env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
                 fix_msg = f"{target_svc} restarted."
