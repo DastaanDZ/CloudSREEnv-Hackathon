@@ -193,30 +193,30 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 # Phase priority matters because every IC history keeps the
                 # original INITIAL ALERT. Later-state evidence must win.
                 if is_after_fix:
-                    manual_reward -= 0.85
+                    manual_reward -= 0.55
                     if target in ["L1_Triage", "L2_DB_SME"]:
                         manual_reward -= 0.10
                 elif is_investigation_only:
                     if target == "L2_DB_SME":
-                        manual_reward -= 0.90
+                        manual_reward -= 0.50
                     elif target == "L1_Triage":
-                        manual_reward -= 0.65
-                    else:
-                        manual_reward -= 0.30
-                elif has_fixable_l1_evidence:
-                    if target == "L2_DB_SME":
-                        manual_reward += 0.90
-                    elif target == "L1_Triage":
-                        manual_reward -= 0.85
-                    else:
                         manual_reward -= 0.35
-                elif is_after_investigation:
+                    else:
+                        manual_reward -= 0.20
+                elif has_fixable_l1_evidence:
                     if target == "L2_DB_SME":
                         manual_reward += 0.65
                     elif target == "L1_Triage":
-                        manual_reward -= 0.55
+                        manual_reward -= 0.50
                     else:
                         manual_reward -= 0.20
+                elif is_after_investigation:
+                    if target == "L2_DB_SME":
+                        manual_reward += 0.45
+                    elif target == "L1_Triage":
+                        manual_reward -= 0.35
+                    else:
+                        manual_reward -= 0.10
                 elif is_initial_alert:
                     if target == "L1_Triage":
                         manual_reward += 0.50
@@ -229,15 +229,15 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         
             elif action_type == "CLOSE_INCIDENT":
                 if is_after_fix:
-                    manual_reward += 0.95
+                    manual_reward += 0.75
                 elif is_after_investigation and is_investigation_only:
-                    manual_reward += 0.90
+                    manual_reward += 0.70
                 elif has_fixable_l1_evidence:
-                    manual_reward -= 0.75
+                    manual_reward -= 0.45
                 elif is_initial_alert:
-                    manual_reward -= 0.60
+                    manual_reward -= 0.50
                 elif is_after_investigation:
-                    manual_reward -= 0.40
+                    manual_reward -= 0.25
                 else:
                     manual_reward -= 0.30
                     
@@ -599,8 +599,8 @@ def build_dataset(num_samples: int = 800):
     
     roles = list(PROMPTS.keys())
     
-    # Part 1: Static scenario messages (40% of dataset)
-    static_samples = int(num_samples * 0.4)
+    # Part 1: Static scenario messages (50% of dataset)
+    static_samples = int(num_samples * 0.5)
     for _ in range(static_samples):
         role_key = roles[torch.randint(0, len(roles), (1,)).item()]
         messages_for_role = SCENARIO_MESSAGES[role_key]
@@ -618,7 +618,7 @@ def build_dataset(num_samples: int = 800):
         )
         prompts_list.append(prompt_str)
     
-    # Part 2: Synthetic trajectories (60% of dataset)
+    # Part 2: Synthetic trajectories (50% of dataset)
     trajectory_samples = num_samples - static_samples
     num_episodes = max(1, (trajectory_samples + 5) // 6)  # Generate enough turns, then slice to target.
     trajectories = generate_synthetic_trajectories(num_episodes)
@@ -661,7 +661,7 @@ def main():
     ).to(DEVICE)
     
     # Build diverse training dataset
-    dataset = build_dataset(num_samples=1200)
+    dataset = build_dataset(num_samples=800)
 
     peft_config = LoraConfig(
         r=16,

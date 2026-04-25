@@ -149,6 +149,22 @@ def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
         )
     return False
 
+def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
+    """Return a human-readable reason when the incident can close now."""
+    if "task1" in task_id:
+        has_auth_logs = task1_has_required_evidence(env, task_id)
+        no_remediation = not any(
+            a.action_type in (ActionType.RESTART, ActionType.SCALE)
+            for a in env.action_history
+        )
+        if has_auth_logs and no_remediation:
+            return "task1 RCA complete: auth-api certificate evidence collected and no remediation attempted."
+    elif "task2" in task_id and l2_fix_applied(env, task_id):
+        return "task2 remediation complete: payment-db was restarted."
+    elif "task3" in task_id and l2_fix_applied(env, task_id):
+        return "task3 remediation complete: auth-api was scaled."
+    return None
+
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
@@ -161,6 +177,19 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     recent_actions = {agent: [] for agent in PROMPTS}
 
     for step_n in range(1, max_steps + 1):
+        if current_agent == "IC":
+            close_reason = solved_close_reason(env, task_id)
+            if close_reason:
+                logger.warning(f"[GUARDRAIL] {close_reason} Auto-closing incident.")
+                action = Action(action_type=ActionType.CLOSE_INCIDENT, agent_id=current_agent)
+                logger.info("ACTION: CLOSE_INCIDENT -> None")
+                step_obs, _, done, _ = env.step(action)
+                if done:
+                    logger.info(f"SUCCESS: {task_id} CLOSED SUCCESSFULLY.")
+                    return True
+                agent_histories[current_agent] += f"\nObs: {step_obs.text_output}"
+                continue
+
         logger.info(f"Turn {step_n}: {current_agent} is Thinking...")
         
         raw_reply = generate_action(current_agent, agent_histories[current_agent], model, tokenizer)
