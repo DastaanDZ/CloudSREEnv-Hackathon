@@ -85,14 +85,16 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
     )
     
     inputs = tokenizer(full_input, return_tensors="pt").to(DEVICE)
+
     with torch.no_grad():
         output_tokens = model.generate(
             **inputs, 
             max_new_tokens=128, 
             pad_token_id=tokenizer.eos_token_id,
-            do_sample=True,             # <-- CHANGED: Allow the model to explore
-            temperature=0.3,            # <-- NEW: Just enough creativity to break loops
-            repetition_penalty=1.1      # <-- NEW: Punishes the model for repeating exact phrases
+            do_sample=True,             # Must be True to use temperature
+            temperature=0.3,            # Adds slight creativity to break loops
+            top_p=0.9,                  # REQUIRED by Qwen to enable sampling
+            repetition_penalty=1.15     # Punishes the model for repeating the same action
         )
     
     # Extract only the newly generated tokens
