@@ -36,15 +36,15 @@ tasks:
     scenario: crash_loop
 
   - id: task3_latency_resolution
-    name: "Cascading Latency Resolution"
+    name: "Auth API Scaling Bottleneck"
     difficulty: hard
     description: >
-      Complex Root Cause Analysis: Detect and fix a bottleneck where 
-      payment-db slowness causes auth-api timeouts. Scaling the 
-      API won't work; the database must be scaled first.
+      Complex Root Cause Analysis: Detect and fix a bottleneck where
+      auth-api is CPU-starved under high RPS, causing customer-facing latency.
+      The agent must inspect logs and scale the overloaded service.
     success_criteria: >
-      Final score 0.99: Both payment-db and auth-api return to 
-      baseline latency thresholds.
+      Final score 1.00: auth-api CPU allocation is raised to at least 2048m
+      and latency returns below the baseline threshold.
     max_steps: 20
     scenario: performance_bottleneck
 

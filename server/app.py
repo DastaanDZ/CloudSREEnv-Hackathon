@@ -623,6 +623,10 @@ def create_app():
         app = FastAPI(title="CloudSREEnv", version="4.0.0-RL")
         env = CloudSREEnv()
 
+        @app.get("/health")
+        def api_health():
+            return JSONResponse({"status": "ok", "environment": "CloudSREEnv"})
+
         @app.post("/reset")
         def api_reset(task_id: Optional[str] = None, scenario: Optional[str] = None):
             obs = env.reset(task_id=task_id, scenario=scenario)
