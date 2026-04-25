@@ -9,7 +9,7 @@ import re
 import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import GRPOTrainer, GRPOConfig
+from trl import GRPOTrainer, GRPOConfig, SFTTrainer, SFTConfig
 from peft import LoraConfig
 
 # Import our environment and data models
@@ -206,6 +206,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             "restarted and is now", "restarted.", "scaled to", "memory limit set", "update_config",
             "repaired", "resynced", "repair_replica"
         ])
+        has_blocked_duplicate = "[blocked] duplicate action" in prompt_lower or "duplicate action" in prompt_lower
+        has_ok_observation = "obs: [ok]" in prompt_lower or "[ok]" in prompt_lower
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
         
@@ -217,9 +219,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 # Phase priority matters because every IC history keeps the
                 # original INITIAL ALERT. Later-state evidence must win.
                 if is_after_fix:
-                    manual_reward -= 0.55
+                    manual_reward -= 0.80
                     if target in ["L1_Triage", "L2_DB_SME"]:
-                        manual_reward -= 0.10
+                        manual_reward -= 0.20
                 elif is_investigation_only:
                     if target == "L2_DB_SME":
                         manual_reward -= 0.50
@@ -253,7 +255,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         
             elif action_type == "CLOSE_INCIDENT":
                 if is_after_fix:
-                    manual_reward += 0.75
+                    manual_reward += 1.00
+                    if "fix applied" in prompt_lower or "new message from l2_db_sme" in prompt_lower:
+                        manual_reward += 0.20
                 elif is_after_investigation and is_investigation_only:
                     manual_reward += 0.70
                 elif has_fixable_l1_evidence:
@@ -294,9 +298,11 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             
             if action_type == "LIST_SERVICES":
                 if has_log_content or has_reported:
-                    manual_reward -= 0.40
+                    manual_reward -= 0.65
+                    if has_blocked_duplicate:
+                        manual_reward -= 0.35
                 elif has_service_list:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.45
                     if is_login_context:
                         manual_reward -= 0.10
                 else:
@@ -311,7 +317,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
                 if has_log_content or has_reported:
-                    manual_reward -= 0.40
+                    manual_reward -= 0.70
+                    if has_blocked_duplicate:
+                        manual_reward -= 0.35
                 elif is_checkout_latency_context and not has_service_list and service_id == "payment-db":
                     manual_reward -= 0.55
                 elif is_resource_contention_context and service_id == "payment-db":
@@ -335,13 +343,19 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
-                if is_checkout_latency_context and not is_resource_contention_context:
+                if target != "IC":
+                    manual_reward -= 0.45
+                elif is_checkout_latency_context and not is_resource_contention_context:
                     manual_reward -= 0.65
                 elif is_split_brain_context and "session-cache-primary" not in prompt_lower and "session-cache-replica" not in prompt_lower:
                     manual_reward -= 0.55
                 elif has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
-                    manual_reward += 0.85
+                    manual_reward += 1.10
+                    if has_blocked_duplicate:
+                        manual_reward += 0.25
+                    if any(kw in prompt_lower for kw in ["root cause", "report findings", "investigation complete"]):
+                        manual_reward += 0.15
                 elif has_reported:
                     # Already reported - don't message again
                     manual_reward -= 0.35
@@ -360,7 +374,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # --- L2_DB_SME Workflow ---
         elif role == "L2_DB_SME":
             fix_already_applied = any(kw in prompt_lower for kw in 
-                ["restarted", "scaled", "fix applied", "recovered", "back online", "memory limit set"])
+                ["restarted", "scaled", "fix applied", "recovered", "back online", "memory limit set", "resynced", "repaired", "[ok]"])
             is_resource_contention_context = (
                 "notification-worker" in prompt_lower
                 and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db"])
@@ -373,7 +387,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.75
+                    if has_ok_observation or has_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif service_id in VALID_SERVICES:
                     if is_split_brain_context and service_id == "checkout-api":
                         manual_reward -= 0.65
@@ -392,7 +408,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 cpu_value = action_dict.get("cpu_value")
                 
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.75
+                    if has_ok_observation or has_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if is_split_brain_context and service_id == "checkout-api":
                         manual_reward -= 0.65
@@ -416,7 +434,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 memory_limit_mb = action_dict.get("memory_limit_mb")
 
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.75
+                    if has_ok_observation or has_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif is_resource_contention_context and service_id != "notification-worker":
                     manual_reward -= 0.80
                 elif service_id == "notification-worker" and isinstance(memory_limit_mb, int):
@@ -436,7 +456,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "REPAIR_REPLICA":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
-                    manual_reward -= 0.25
+                    manual_reward -= 0.75
+                    if has_ok_observation or has_blocked_duplicate:
+                        manual_reward -= 0.25
                 elif service_id == "session-cache-replica":
                     manual_reward += 0.85
                     if is_split_brain_context:
@@ -449,9 +471,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
                 if fix_already_applied and target == "IC":
-                    manual_reward += 0.40
+                    manual_reward += 1.00
+                    if has_ok_observation:
+                        manual_reward += 0.20
+                    if has_blocked_duplicate:
+                        manual_reward += 0.15
                 elif not fix_already_applied:
-                    manual_reward -= 0.20
+                    manual_reward -= 0.35
                 else:
                     manual_reward += 0.05
                     
@@ -647,6 +673,151 @@ def _detect_role_from_prompt(prompt_str: str) -> str:
 # ---------------------------------------------------------------------------
 # 2. Multi-Role Dataset with Synthetic Trajectories
 # ---------------------------------------------------------------------------
+def _gold_json(action: dict) -> str:
+    """Compact expert action used for supervised warm-start examples."""
+    return json.dumps(action, separators=(",", ":"))
+
+
+def generate_expert_examples(num_episodes: int = 80):
+    """
+    Generate supervised prompt -> exact JSON action examples.
+
+    GRPO alone is weak when the base model rarely samples the correct handoff.
+    These examples teach the policy the action grammar and multi-agent state
+    transitions before reward optimization.
+    """
+    examples = []
+    tasks = [
+        "task1_tls_certificate_rca",
+        "task2_self_healing",
+        "task3_latency_resolution",
+        "task4_resource_contention",
+        "task5_split_brain_cache_consistency",
+    ]
+
+    for episode_idx in range(num_episodes):
+        env = CloudSREEnv()
+        task = tasks[episode_idx % len(tasks)]
+        obs = env.reset(task_id=task)
+        histories = {
+            "IC": f"INITIAL ALERT:\n{obs.text_output}",
+            "L1_Triage": "",
+            "L2_DB_SME": "",
+        }
+
+        examples.append((
+            "IC",
+            histories["IC"],
+            _gold_json({
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "L1_Triage",
+                "message": "Investigate the incident and report root cause.",
+            }),
+        ))
+
+        if "task1" in task:
+            histories["L1_Triage"] = "New message from IC: Investigate customer login failures in the authentication flow. Check auth-api if needed."
+        elif "task4" in task:
+            histories["L1_Triage"] = "New message from IC: Checkout latency on payment-db. First run LIST_SERVICES and look for noisy neighbors before checking DB logs."
+        elif "task5" in task:
+            histories["L1_Triage"] = "New message from IC: Intermittent checkout cart total mismatch and session failures. Inspect checkout-api, then compare both session cache nodes."
+        else:
+            histories["L1_Triage"] = "New message from IC: Investigate the incident. Check cluster status."
+
+        examples.append(("L1_Triage", histories["L1_Triage"], _gold_json({"action_type": "LIST_SERVICES"})))
+        list_obs, _, _, _ = env.step(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
+        histories["L1_Triage"] += f"\nObs: {list_obs.text_output}"
+
+        if "task2" in task:
+            target_svc = "payment-db"
+        elif "task4" in task:
+            target_svc = "notification-worker"
+        elif "task5" in task:
+            target_svc = "session-cache-replica"
+        else:
+            target_svc = "auth-api"
+
+        if "task5" in task:
+            examples.append(("L1_Triage", histories["L1_Triage"], _gold_json({"action_type": "GET_LOGS", "service_id": "checkout-api"})))
+            checkout_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="checkout-api"))
+            histories["L1_Triage"] += f"\nObs: {checkout_obs.text_output}"
+
+            examples.append(("L1_Triage", histories["L1_Triage"], _gold_json({"action_type": "GET_LOGS", "service_id": "session-cache-primary"})))
+            primary_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-primary"))
+            histories["L1_Triage"] += f"\nObs: {primary_obs.text_output}"
+
+            examples.append(("L1_Triage", histories["L1_Triage"], _gold_json({"action_type": "GET_LOGS", "service_id": "session-cache-replica"})))
+            replica_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="session-cache-replica"))
+            histories["L1_Triage"] += f"\nObs: {replica_obs.text_output}"
+            finding = "Root cause: session-cache split-brain. primary cache_epoch=1842 but replica cache_epoch=1837. It needs REPAIR_REPLICA on session-cache-replica."
+        else:
+            examples.append(("L1_Triage", histories["L1_Triage"], _gold_json({"action_type": "GET_LOGS", "service_id": target_svc})))
+            log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
+            histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
+
+            if "task1" in task:
+                finding = "Root cause: auth-api has expired TLS certificate. No local fix available."
+            elif "task2" in task:
+                finding = "Root cause: payment-db is in CrashLoopBackOff with OOMKilled errors. It needs RESTART."
+            elif "task4" in task:
+                finding = "Root cause: notification-worker is using 8000MB RAM and starving payment-db. It needs UPDATE_CONFIG memory_limit_mb 2048."
+            else:
+                finding = "Root cause: auth-api CPU is saturated under high RPS, causing latency. It needs SCALE to 2048 CPU."
+
+        report_action = _gold_json({"action_type": "MESSAGE_CHANNEL", "target": "IC", "message": finding})
+        examples.append(("L1_Triage", histories["L1_Triage"], report_action))
+        examples.append((
+            "L1_Triage",
+            histories["L1_Triage"] + "\nObs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.",
+            report_action,
+        ))
+
+        histories["IC"] += f"\nNew message from L1_Triage: {finding}"
+        if "task1" in task:
+            examples.append(("IC", histories["IC"], _gold_json({"action_type": "CLOSE_INCIDENT"})))
+            continue
+
+        if "task2" in task:
+            delegate_msg = "Restart payment-db to recover from CrashLoopBackOff."
+            fix_action = {"action_type": "RESTART", "service_id": "payment-db"}
+            fix_msg = "Fix applied. payment-db restarted."
+        elif "task4" in task:
+            delegate_msg = "Set notification-worker memory limit to 2048MB to stop starving payment-db."
+            fix_action = {"action_type": "UPDATE_CONFIG", "service_id": "notification-worker", "memory_limit_mb": 2048}
+            fix_msg = "Fix applied. notification-worker memory limit set to 2048MB."
+        elif "task5" in task:
+            delegate_msg = "Repair session-cache-replica to resync divergent cache epochs."
+            fix_action = {"action_type": "REPAIR_REPLICA", "service_id": "session-cache-replica"}
+            fix_msg = "Fix applied. session-cache-replica repaired and resynced."
+        else:
+            delegate_msg = "Scale auth-api to 2048 CPU to resolve latency."
+            fix_action = {"action_type": "SCALE", "service_id": "auth-api", "cpu_value": 2048}
+            fix_msg = "Fix applied. auth-api scaled to 2048 CPU."
+
+        examples.append((
+            "IC",
+            histories["IC"],
+            _gold_json({"action_type": "MESSAGE_CHANNEL", "target": "L2_DB_SME", "message": delegate_msg}),
+        ))
+        histories["L2_DB_SME"] = f"New message from IC: {delegate_msg}"
+        examples.append(("L2_DB_SME", histories["L2_DB_SME"], _gold_json(fix_action)))
+
+        fix_obs, _, _, _ = env.step(Action(agent_id="L2_DB_SME", **fix_action))
+        histories["L2_DB_SME"] += f"\nObs: {fix_obs.text_output}"
+        complete_action = _gold_json({"action_type": "MESSAGE_CHANNEL", "target": "IC", "message": fix_msg})
+        examples.append(("L2_DB_SME", histories["L2_DB_SME"], complete_action))
+        examples.append((
+            "L2_DB_SME",
+            histories["L2_DB_SME"] + "\nObs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.",
+            complete_action,
+        ))
+
+        histories["IC"] += f"\nNew message from L2_DB_SME: {fix_msg}"
+        examples.append(("IC", histories["IC"], _gold_json({"action_type": "CLOSE_INCIDENT"})))
+
+    return examples
+
+
 def generate_synthetic_trajectories(num_episodes: int = 50):
     """
     Generate synthetic multi-turn trajectories using expert policy.
@@ -707,6 +878,11 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         
         # Turn 4: L1 reports to IC (should MESSAGE_CHANNEL)
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
+        trajectories.append((
+            "L1_Triage",
+            agent_histories["L1_Triage"]
+            + "\nObs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings."
+        ))
         
         if "task1" in task:
             # Task1 TLS RCA: investigation-only, no L2 needed
@@ -764,6 +940,11 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             
             # Turn 7: L2 reports completion to IC
             trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
+            trajectories.append((
+                "L2_DB_SME",
+                agent_histories["L2_DB_SME"]
+                + "\nObs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings."
+            ))
             agent_histories["IC"] += f"\nNew message from L2_DB_SME: Fix applied. {fix_msg}"
             
             # Turn 8: IC closes incident
@@ -827,6 +1008,22 @@ def build_dataset(num_samples: int = 800):
     logger.info(f"Built dataset with {len(prompts_list)} examples ({static_samples} static + {len(selected_trajectories)} trajectory)")
     return Dataset.from_dict({"prompt": prompts_list})
 
+
+def build_sft_dataset(tokenizer, num_episodes: int = 80):
+    """Build supervised chat transcripts with exact expert JSON completions."""
+    texts = []
+    for role_key, user_msg, assistant_msg in generate_expert_examples(num_episodes):
+        messages = [
+            {"role": "system", "content": PROMPTS[role_key]},
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": assistant_msg},
+        ]
+        texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
+
+    random.shuffle(texts)
+    logger.info(f"Built SFT warm-start dataset with {len(texts)} expert examples")
+    return Dataset.from_dict({"text": texts})
+
 # ---------------------------------------------------------------------------
 # 3. The Main Training Loop
 # ---------------------------------------------------------------------------
@@ -845,15 +1042,44 @@ def main():
         attn_implementation="sdpa",
     ).to(DEVICE)
     
-    # Build diverse training dataset
-    dataset = build_dataset(num_samples=800)
-
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         task_type="CAUSAL_LM",
     )
+
+    # Phase 1: supervised warm-start on exact expert actions. This prevents
+    # GRPO from wasting early steps discovering JSON format and handoff basics.
+    sft_dataset = build_sft_dataset(tokenizer, num_episodes=100)
+    sft_args = SFTConfig(
+        output_dir="./grpo_sre_model/sft_warmstart",
+        learning_rate=1e-4,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
+        num_train_epochs=2,
+        logging_steps=10,
+        report_to="none",
+        bf16=torch.cuda.is_available(),
+        fp16=False,
+        max_length=1024,
+        packing=False,
+    )
+
+    sft_trainer = SFTTrainer(
+        model=model,
+        args=sft_args,
+        train_dataset=sft_dataset,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+    )
+
+    logger.info("\n========== STARTING SFT WARM-START ==========")
+    sft_trainer.train()
+    model = sft_trainer.model
+
+    # Phase 2: GRPO reward optimization on the same scenario distribution.
+    dataset = build_dataset(num_samples=800)
 
     # --- GRPO Training Configuration ---
     training_args = GRPOConfig(
@@ -879,7 +1105,6 @@ def main():
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
-        peft_config=peft_config
     )
 
     logger.info("\n========== STARTING GRPO RL TRAINING ==========")

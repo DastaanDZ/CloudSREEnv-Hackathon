@@ -37,6 +37,7 @@ logger = logging.getLogger("Evaluator")
 EVAL_MODE = "TRAINED" 
 # Raw evaluation disables corrective hints, forced delegation, and auto-closing.
 USE_GUARDRAILS = False
+EVAL_STYLE = "GUARDED" if USE_GUARDRAILS else "RAW"
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
@@ -223,7 +224,7 @@ def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
     return None
 
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
-    logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
+    logger.info(f"========== EVALUATING SCENARIO: {task_id} [{EVAL_STYLE}] ==========")
     obs = env.reset(task_id=task_id)
     
     agent_histories = {agent: f"INITIAL ALERT:\n{obs.text_output}" for agent in PROMPTS}
@@ -510,6 +511,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
 # ---------------------------------------------------------------------------
 def main():
     # 1. Load the model (Mode based on EVAL_MODE at top)
+    logger.info(f"Evaluation mode: {EVAL_MODE} | style: {EVAL_STYLE}")
     model, tokenizer = load_eval_model(mode=EVAL_MODE)
     
     # 2. Run scenarios
@@ -526,7 +528,7 @@ def main():
     for task in tasks:
         results[task] = run_multi_agent_task(env, task, model, tokenizer)
     
-    logger.info(f"FINAL RESULTS ({EVAL_MODE}): {results}")
+    logger.info(f"FINAL RESULTS ({EVAL_MODE}, {EVAL_STYLE}): {results}")
 
 if __name__ == "__main__":
     main()
