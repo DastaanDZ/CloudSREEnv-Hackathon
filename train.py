@@ -144,6 +144,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
         is_after_investigation = any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
         is_after_fix = any(kw in prompt_lower for kw in ["l2_db_sme confirms", "l2_db_sme reports", "all services now healthy", "fix successfully", "restarted and is now", "scaled to"])
+        is_investigation_only = any(kw in prompt_lower for kw in ["tls", "certificate", "handshake", "no local fix", "no fix available"])
         
         # --- IC Workflow ---
         if role == "IC":
@@ -158,15 +159,23 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     else:
                         manual_reward -= 0.10
                 elif is_after_investigation:
-                    if target == "L2_DB_SME":
-                        manual_reward += 0.50
-                    elif target == "L1_Triage":
-                        manual_reward -= 0.15
+                    if is_investigation_only:
+                        if target == "L2_DB_SME":
+                            manual_reward -= 0.30
+                        else:
+                            manual_reward += 0.10
+                    else:
+                        if target == "L2_DB_SME":
+                            manual_reward += 0.50
+                        elif target == "L1_Triage":
+                            manual_reward -= 0.15
                 else:
                     manual_reward += 0.20
                         
             elif action_type == "CLOSE_INCIDENT":
                 if is_after_fix:
+                    manual_reward += 0.45
+                elif is_after_investigation and is_investigation_only:
                     manual_reward += 0.45
                 elif is_initial_alert:
                     manual_reward -= 0.60
@@ -465,25 +474,34 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         
         # Turn 4: L1 reports to IC (should MESSAGE_CHANNEL)
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
-        finding = f"Root cause: {target_svc} issue found in logs."
-        agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
         
-        # Turn 5: IC delegates to L2
-        trajectories.append(("IC", agent_histories["IC"]))
-        agent_histories["L2_DB_SME"] = f"New message from IC: Fix {target_svc}. Apply RESTART or SCALE as needed."
-        
-        # Turn 6: L2 applies fix
-        trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
-        if "task3" in task:
-            env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
-            fix_msg = f"{target_svc} scaled to 2048 CPU."
+        if "task1" in task:
+            # Task1 TLS RCA: investigation-only, no L2 needed
+            finding = f"Root cause: {target_svc} has expired TLS certificate. No local fix available."
+            agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
+            # Turn 5: IC closes incident (no remediation possible)
+            trajectories.append(("IC", agent_histories["IC"]))
         else:
-            env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
-            fix_msg = f"{target_svc} restarted."
-        agent_histories["IC"] += f"\nNew message from L2_DB_SME: Fix applied. {fix_msg}"
-        
-        # Turn 7: IC closes incident
-        trajectories.append(("IC", agent_histories["IC"]))
+            # Task2/Task3: full remediation workflow via L2
+            finding = f"Root cause: {target_svc} issue found in logs."
+            agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
+            
+            # Turn 5: IC delegates to L2
+            trajectories.append(("IC", agent_histories["IC"]))
+            agent_histories["L2_DB_SME"] = f"New message from IC: Fix {target_svc}. Apply RESTART or SCALE as needed."
+            
+            # Turn 6: L2 applies fix
+            trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
+            if "task3" in task:
+                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
+                fix_msg = f"{target_svc} scaled to 2048 CPU."
+            else:
+                env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
+                fix_msg = f"{target_svc} restarted."
+            agent_histories["IC"] += f"\nNew message from L2_DB_SME: Fix applied. {fix_msg}"
+            
+            # Turn 7: IC closes incident
+            trajectories.append(("IC", agent_histories["IC"]))
     
     return trajectories
 
