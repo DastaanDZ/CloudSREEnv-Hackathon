@@ -63,53 +63,50 @@ PROMPTS = {
     "L2_DB_SME": L2_PROMPT
 }
 
-# Scenario messages for training - NO explicit action hints!
-# The model must learn to infer correct actions from context alone.
+# Scenario messages matching INFERENCE FORMAT (with Obs:, New message from:, etc.)
+# The model must learn to handle accumulated multi-turn context.
 SCENARIO_MESSAGES = {
     "IC": [
-        # Initial alerts - model should learn IC delegates to L1 first
-        "INITIAL ALERT: payment-db status transition to Error detected.",
-        "SYSTEM ALERT: High latency (850ms) detected on auth-api.",
-        "ESCALATION: Multiple services reporting upstream failures.",
-        "ALERT: notification-worker showing degraded performance.",
-        "INCIDENT: auth-api returning 503 errors to users.",
+        # Turn 1: Initial alerts (IC sees this first)
+        "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency (850ms) detected on auth-api.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Multiple services reporting upstream failures.",
         
-        # After L1 investigation - model should learn IC delegates to L2 for fixes
-        "L1_Triage reports: payment-db is in CrashLoopBackOff. Logs show OOMKilled error.",
-        "L1_Triage found: auth-api at 99.8% CPU under high RPS load.",
-        "L1_Triage identified root cause: payment-db crashed, causing upstream failures.",
-        "L1_Triage diagnostic: inventory-svc failing due to payment-db being in Error state.",
+        # Turn 3: After L1 investigated and reported back
+        "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: Root cause found. payment-db is in CrashLoopBackOff with OOMKilled error.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api at 99.8% CPU. Needs scaling.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Services failing.\nNew message from L1_Triage: payment-db crashed, causing cascading failures to inventory-svc.",
         
-        # After L2 fix - model should learn IC closes incident
-        "L2_DB_SME confirms: payment-db has been restarted and is now Running.",
-        "L2_DB_SME reports: auth-api scaled to 2048 CPU, latency back to normal.",
-        "UPDATE: All services now healthy. L2_DB_SME applied the fix successfully.",
+        # Turn 5: After L2 applied fix
+        "INITIAL ALERT:\n[SYSTEM ALERT] payment-db Error.\nNew message from L1_Triage: payment-db OOMKilled.\nNew message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency.\nNew message from L1_Triage: auth-api overloaded.\nNew message from L2_DB_SME: auth-api scaled to 2048 CPU. Latency resolved.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Cascading failures.\nNew message from L2_DB_SME: payment-db restarted. All services recovering.",
     ],
     "L1_Triage": [
-        # Investigation context - model should learn L1 uses LIST_SERVICES/GET_LOGS
-        "IC says: We have an incident. What's the cluster status?",
-        "IC says: Something is wrong with the services. Investigate.",
-        "IC says: Users are reporting errors. Find out what's happening.",
-        "IC says: Check the system health.",
+        # Turn 2: IC delegated investigation to L1
+        "New message from IC: Investigate the cluster status. Find what's causing the alert.",
+        "New message from IC: We have an incident with payment-db. Check it out.",
+        "New message from IC: Users reporting errors. Investigate and report back.",
+        "New message from IC: Something is wrong. List services and check logs.",
         
-        # Specific investigation - model should learn to GET_LOGS on mentioned service
-        "IC says: payment-db might be the issue. Check it out.",
-        "IC says: Look into auth-api, users report slow logins.",
-        "IC says: Investigate why notification-worker is slow.",
-        "IC says: inventory-svc is showing errors. Find the root cause.",
-        "IC says: We need logs from payment-db to understand the crash.",
+        # After LIST_SERVICES, need to GET_LOGS
+        "New message from IC: Investigate the incident.\nObs: auth-api              Running    45ms\npayment-db            Error      0ms\ninventory-svc         Running    120ms",
+        "New message from IC: Check the cluster.\nObs: auth-api              Running    850ms\npayment-db            Running    12ms",
+        
+        # After GET_LOGS, should report to IC
+        "New message from IC: Check payment-db.\nObs: auth-api   Running   payment-db   Error\nObs: === Logs: payment-db ===\n[ERROR] OOMKilled\n[ERROR] CrashLoopBackOff",
+        "New message from IC: Investigate auth-api latency.\nObs: === Logs: auth-api ===\n[WARN] RPS=3500 — CPU usage 99.8%",
     ],
     "L2_DB_SME": [
-        # Fix context - model should learn L2 uses RESTART for crashes
-        "IC says: payment-db is crashed and needs to be fixed.",
-        "IC says: The database is in Error state. Recover it.",
-        "IC says: payment-db OOMKilled. Bring it back online.",
-        "IC says: inventory-svc is down. Fix it.",
+        # Turn 4: IC delegated fix to L2
+        "New message from IC: payment-db is crashed. Restart it to recover.",
+        "New message from IC: L1 found payment-db OOMKilled. Apply RESTART to payment-db.",
+        "New message from IC: auth-api needs more resources. Scale it to 2048 CPU.",
+        "New message from IC: Database crashed. Fix payment-db immediately.",
+        "New message from IC: High CPU on auth-api causing latency. Scale auth-api.",
         
-        # Scale context - model should learn L2 uses SCALE for performance
-        "IC says: auth-api is overloaded and needs more resources.",
-        "IC says: High CPU on auth-api causing latency. Fix the performance.",
-        "IC says: payment-db needs more CPU to handle the load.",
-        "IC says: Scale up auth-api to resolve the bottleneck.",
+        # With observation context
+        "New message from IC: Fix the database.\nObs: payment-db is in Error state with OOMKilled.",
+        "New message from IC: Resolve the performance issue.\nObs: auth-api at 99.8% CPU, latency 850ms.",
     ],
 }

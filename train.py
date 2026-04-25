@@ -293,6 +293,41 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 reward -= 0.10
         
         # =====================================================================
+        # STAGE 8: Environment execution for ground-truth validation
+        # =====================================================================
+        try:
+            action_dict["agent_id"] = role
+            env = CloudSREEnv()
+            
+            # Select scenario based on prompt context
+            if "error" in prompt_lower or "crash" in prompt_lower or "oom" in prompt_lower:
+                env.reset(task_id="task2_self_healing")
+            elif "latency" in prompt_lower or "slow" in prompt_lower or "cpu" in prompt_lower:
+                env.reset(task_id="task3_latency_resolution")
+            else:
+                env.reset(task_id="task1_status_audit")
+            
+            # Execute action in environment
+            action = Action(**action_dict)
+            _, reward_obj, done, _ = env.step(action)
+            
+            # Add environment's dense rewards (scaled to be supplementary)
+            for component, value in reward_obj.breakdown.items():
+                reward += value * 0.15  # Scaled contribution from env
+            
+            # Bonus if action actually completes the task
+            if done and reward_obj.value > 0:
+                reward += 0.25
+                
+            # Environment's RBAC penalties are strong signals
+            if "rbac_penalty" in reward_obj.breakdown:
+                reward += reward_obj.breakdown["rbac_penalty"] * 0.5  # Amplify RBAC violation
+                
+        except Exception:
+            # If action can't be executed (invalid schema), small penalty
+            reward -= 0.05
+        
+        # =====================================================================
         # Final: Clamp to [-1.0, 1.0]
         # =====================================================================
         rewards.append(max(-1.0, min(1.0, reward)))
@@ -311,25 +346,83 @@ def _detect_role_from_prompt(prompt_str: str) -> str:
         return "L2_DB_SME"
     return "IC"
 # ---------------------------------------------------------------------------
-# 2. Multi-Role Dataset (uses SCENARIO_MESSAGES from prompts.py)
+# 2. Multi-Role Dataset with Synthetic Trajectories
 # ---------------------------------------------------------------------------
-def build_dataset(num_samples: int = 500):
+def generate_synthetic_trajectories(num_episodes: int = 50):
     """
-    Builds a diverse dataset that shuffles roles and scenarios.
+    Generate synthetic multi-turn trajectories using expert policy.
+    Returns list of (role, prompt) tuples representing each turn.
+    """
+    trajectories = []
     
-    Args:
-        num_samples: Number of training examples to generate (default 500)
+    for _ in range(num_episodes):
+        env = CloudSREEnv()
+        # Randomly pick a task
+        task = ["task1_status_audit", "task2_self_healing", "task3_latency_resolution"][torch.randint(0, 3, (1,)).item()]
+        obs = env.reset(task_id=task)
+        
+        # Simulate expert trajectory
+        agent_histories = {
+            "IC": f"INITIAL ALERT:\n{obs.text_output}",
+            "L1_Triage": "",
+            "L2_DB_SME": ""
+        }
+        
+        # Turn 1: IC delegates to L1
+        trajectories.append(("IC", agent_histories["IC"]))
+        agent_histories["L1_Triage"] = "New message from IC: Investigate the incident. Check cluster status."
+        
+        # Turn 2: L1 lists services
+        trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
+        list_obs, _, _, _ = env.step(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
+        agent_histories["L1_Triage"] += f"\nObs: {list_obs.text_output}"
+        
+        # Turn 3: L1 gets logs from problematic service
+        trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
+        target_svc = "payment-db" if "task1" in task or "task2" in task else "auth-api"
+        log_obs, _, _, _ = env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id=target_svc))
+        agent_histories["L1_Triage"] += f"\nObs: {log_obs.text_output}"
+        
+        # Turn 4: L1 reports to IC (should MESSAGE_CHANNEL)
+        trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
+        finding = f"Root cause: {target_svc} issue found in logs."
+        agent_histories["IC"] += f"\nNew message from L1_Triage: {finding}"
+        
+        # Turn 5: IC delegates to L2
+        trajectories.append(("IC", agent_histories["IC"]))
+        agent_histories["L2_DB_SME"] = f"New message from IC: Fix {target_svc}. Apply RESTART or SCALE as needed."
+        
+        # Turn 6: L2 applies fix
+        trajectories.append(("L2_DB_SME", agent_histories["L2_DB_SME"]))
+        if "task3" in task:
+            env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id=target_svc, cpu_value=2048))
+            fix_msg = f"{target_svc} scaled to 2048 CPU."
+        else:
+            env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id=target_svc))
+            fix_msg = f"{target_svc} restarted."
+        agent_histories["IC"] += f"\nNew message from L2_DB_SME: Fix applied. {fix_msg}"
+        
+        # Turn 7: IC closes incident
+        trajectories.append(("IC", agent_histories["IC"]))
+    
+    return trajectories
+
+
+def build_dataset(num_samples: int = 800):
+    """
+    Builds a diverse dataset combining:
+    1. Static scenario messages from prompts.py
+    2. Synthetic multi-turn trajectories from expert policy
     """
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     prompts_list = []
     
     roles = list(PROMPTS.keys())
     
-    for _ in range(num_samples):
-        # Randomly select a role
+    # Part 1: Static scenario messages (60% of dataset)
+    static_samples = int(num_samples * 0.6)
+    for _ in range(static_samples):
         role_key = roles[torch.randint(0, len(roles), (1,)).item()]
-        
-        # Randomly select a scenario message for this role
         messages_for_role = SCENARIO_MESSAGES[role_key]
         msg = messages_for_role[torch.randint(0, len(messages_for_role), (1,)).item()]
         
@@ -338,16 +431,36 @@ def build_dataset(num_samples: int = 500):
             {"role": "user", "content": msg}
         ]
         
-        # Convert the chat list into a single formatted string for Llama 3
         prompt_str = tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=True
         )
-        
         prompts_list.append(prompt_str)
     
-    logger.info(f"Built dataset with {len(prompts_list)} training examples across {len(roles)} roles")
+    # Part 2: Synthetic trajectories (40% of dataset)
+    trajectory_samples = num_samples - static_samples
+    num_episodes = trajectory_samples // 7  # ~7 turns per episode
+    trajectories = generate_synthetic_trajectories(num_episodes)
+    
+    for role_key, user_msg in trajectories[:trajectory_samples]:
+        messages = [
+            {"role": "system", "content": PROMPTS[role_key]},
+            {"role": "user", "content": user_msg}
+        ]
+        
+        prompt_str = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        prompts_list.append(prompt_str)
+    
+    # Shuffle to mix static and trajectory samples
+    import random
+    random.shuffle(prompts_list)
+    
+    logger.info(f"Built dataset with {len(prompts_list)} examples ({static_samples} static + {len(trajectories)} trajectory)")
     return Dataset.from_dict({"prompt": prompts_list})
 
 # ---------------------------------------------------------------------------

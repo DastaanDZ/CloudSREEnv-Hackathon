@@ -22,7 +22,8 @@ logger = logging.getLogger("Evaluator")
 EVAL_MODE = "TRAINED" 
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
-BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+# BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------------------------------------------------------------------
@@ -56,9 +57,17 @@ def load_eval_model(mode="TRAINED"):
 def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
     """Generates a response from the loaded model (Base or Trained)."""
     system_prompt = PROMPTS[agent_role]
-    # Llama 3 format
-    full_input = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-    full_input += f"<|start_header_id|>user<|end_header_id|>\n\n{history}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    
+    # Use tokenizer's chat template (works for any model: Llama, Qwen, etc.)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": history}
+    ]
+    full_input = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
     
     inputs = tokenizer(full_input, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
