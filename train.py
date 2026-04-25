@@ -30,27 +30,25 @@ def sre_rubric_reward(prompts, completions, **kwargs):
     rewards = []
     env = CloudSREEnv()
     
-    for prompt, completion in zip(prompts, completions):
-        # Determine which role the model was playing for this specific completion
-        # prompt[0]['content'] contains the system prompt which identifies the role
-        system_content = prompt[0]['content']
-        current_role = "IC" if "Commander" in system_content else ("L2_DB_SME" if "L2" in system_content else "L1_Triage")
+    for prompt_str, completion in zip(prompts, completions):
+        # Identify role based on keywords in the formatted prompt string
+        if "Incident Commander" in prompt_str:
+            current_role = "IC"
+        elif "L2 Database SME" in prompt_str:
+            current_role = "L2_DB_SME"
+        else:
+            current_role = "L1_Triage"
         
         raw_text = completion[0]['content'] if isinstance(completion, list) else completion
         
-        # --- CRITICAL: FORMATTING RUBRIC ---
-        # Judges love 'composable rubrics' [cite: 92]
-        format_reward = 0.0
-        # Check if it's strictly JSON with no chatter
-        if raw_text.strip().startswith("{") and raw_text.strip().endswith("}"):
-            format_reward = 0.2  # Reward for strict adherence to format
-        else:
-            format_reward = -0.3 # Penalize chatter
+        # --- FORMATTING RUBRIC ---
+        format_reward = 0.2 if raw_text.strip().startswith("{") and raw_text.strip().endswith("}") else -0.3
             
         # --- ENVIRONMENT RUBRIC ---
         match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         clean_json = match.group(0) if match else "{}"
         
+        # Set scenario based on role [cite: 5, 37]
         env.reset(task_id="task1_status_audit" if current_role != "L2_DB_SME" else "task2_self_healing")
         
         try:
@@ -62,31 +60,36 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             
         _, reward_obj, _, _ = env.step(action)
         
-        # Total Reward = Format Adherence + Task Success
-        total_reward = format_reward + float(reward_obj.value)
-        rewards.append(total_reward)
+        # Composable reward: Format Adherence + Environment Success [cite: 92]
+        rewards.append(format_reward + float(reward_obj.value))
 
     return rewards
-
 # ---------------------------------------------------------------------------
 # 2. Multi-Role Dataset
 # ---------------------------------------------------------------------------
 def build_dataset():
-    """Builds a dataset that shuffles between IC, L1, and L2 roles."""
+    """Builds a dataset that shuffles between IC, L1, and L2 roles with chat templates."""
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     data = []
-    # Mix of scenarios to ensure the model doesn't 'overfit' on one task [cite: 27]
-    roles = [("IC", "INITIAL ALERT: payment-db in Error"), 
-             ("L1_Triage", "IC Message: Audit the database"), 
-             ("L2_DB_SME", "IC Message: Fix payment-db")]
+    roles = [
+        ("IC", "INITIAL ALERT: payment-db in Error"), 
+        ("L1_Triage", "IC Message: Audit the database"), 
+        ("L2_DB_SME", "IC Message: Fix payment-db")
+    ]
              
-    for _ in range(100): # Increased size for better convergence
+    for _ in range(100):
         role, msg = roles[torch.randint(0, len(roles), (1,)).item()]
-        data.append({
-            "prompt": [
-                {"role": "system", "content": PROMPTS[role]},
-                {"role": "user", "content": msg}
-            ]
-        })
+        
+        messages = [
+            {"role": "system", "content": PROMPTS[role]},
+            {"role": "user", "content": msg}
+        ]
+        
+        # Apply the chat template to create a single string prompt
+        prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        data.append({"prompt": prompt_str})
+        
     return Dataset.from_dict({"prompt": data})
 
 # ---------------------------------------------------------------------------
