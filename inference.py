@@ -36,6 +36,8 @@ logger = logging.getLogger("Evaluator")
 # ---------------------------------------------------------------------------
 # TOGGLE THIS: Use "BASE" to generate 'Before' logs, "TRAINED" for 'After' logs.
 EVAL_MODE = "TRAINED" 
+# Set True for fair BASE vs TRAINED comparison without controller-style guardrails.
+STRICT_EVAL = True
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
@@ -68,6 +70,7 @@ def new_episode_trace(task_id: str, initial_observation: str) -> dict:
     return {
         "task_id": task_id,
         "eval_mode": EVAL_MODE,
+        "strict_eval": STRICT_EVAL,
         "base_model": BASE_MODEL_NAME,
         "started_at": datetime.utcnow().isoformat() + "Z",
         "initial_observation": initial_observation,
@@ -133,6 +136,7 @@ def save_episode_trace(trace: dict, success: bool) -> None:
         f"# Episode Trace: {trace['task_id']}",
         "",
         f"- Mode: {trace['eval_mode']}",
+        f"- Strict eval: {trace['strict_eval']}",
         f"- Base model: {trace['base_model']}",
         f"- Success: {success}",
         f"- Total env reward: {trace['total_reward']:.3f}",
@@ -311,7 +315,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     recent_actions = {agent: [] for agent in PROMPTS}
 
     for step_n in range(1, max_steps + 1):
-        if current_agent == "IC":
+        if not STRICT_EVAL and current_agent == "IC":
             close_reason = solved_close_reason(env, task_id)
             if close_reason:
                 logger.warning(f"[GUARDRAIL] {close_reason} Auto-closing incident.")
@@ -375,7 +379,9 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         recent_actions[current_agent].append(action_key)
         
         # Detect repetition (same action 2+ times)
-        if len(recent_actions[current_agent]) >= 2 and recent_actions[current_agent][-1] == recent_actions[current_agent][-2]:
+        if (not STRICT_EVAL
+                and len(recent_actions[current_agent]) >= 2
+                and recent_actions[current_agent][-1] == recent_actions[current_agent][-2]):
             logger.warning(f"Repetition detected for {current_agent}. Injecting hint.")
             if current_agent == "L1_Triage":
                 next_action = suggested_l1_log_action(agent_histories[current_agent], task_id)
@@ -418,7 +424,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             agent_histories[current_agent] += "\n[SYSTEM] Invalid target. Use exactly one of: IC, L1_Triage, L2_DB_SME."
             continue
 
-        if (current_agent == "IC"
+        if (not STRICT_EVAL
+                and current_agent == "IC"
                 and task1_has_required_evidence(env, task_id)
                 and action.action_type == ActionType.MESSAGE_CHANNEL
                 and action.target == "L2_DB_SME"):
@@ -439,7 +446,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             continue
 
         required_l2 = required_l2_delegation(env, task_id)
-        if (current_agent == "IC"
+        if (not STRICT_EVAL
+                and current_agent == "IC"
                 and required_l2
                 and not l2_fix_applied(env, task_id)
                 and (action.action_type != ActionType.MESSAGE_CHANNEL or action.target != "L2_DB_SME")):
@@ -459,7 +467,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             )
             continue
 
-        if (current_agent == "L2_DB_SME"
+        if (not STRICT_EVAL
+                and current_agent == "L2_DB_SME"
                 and l2_fix_applied(env, task_id)
                 and action.action_type in (ActionType.RESTART, ActionType.SCALE)):
             logger.warning("L2 fix already applied; blocking repeated remediation.")
@@ -479,7 +488,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             )
             continue
 
-        if (current_agent == "IC"
+        if (not STRICT_EVAL
+                and current_agent == "IC"
                 and l2_fix_applied(env, task_id)
                 and action.action_type == ActionType.MESSAGE_CHANNEL):
             logger.warning("L2 fix is complete; forcing incident closure.")
@@ -498,7 +508,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             )
             continue
 
-        if (current_agent == "L1_Triage"
+        if (not STRICT_EVAL
+                and current_agent == "L1_Triage"
                 and action.action_type == ActionType.GET_LOGS
                 and any(a.action_type == ActionType.GET_LOGS and a.service_id == action.service_id for a in env.action_history)):
             logger.warning("L1 already has logs; blocking repeated GET_LOGS.")
@@ -520,7 +531,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         # Safety net: L1 must investigate before reporting to IC.
         # Without this, L1 can shortcut by messaging IC immediately, which derails
         # task1 (no GET_LOGS evidence -> CLOSE_INCIDENT rejected) and wastes turns.
-        if (current_agent == "L1_Triage"
+        if (not STRICT_EVAL
+                and current_agent == "L1_Triage"
                 and action.action_type == ActionType.MESSAGE_CHANNEL
                 and action.target == "IC"):
             prior_actions = recent_actions[current_agent][:-1]
