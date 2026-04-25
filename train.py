@@ -16,7 +16,8 @@ from server.app import CloudSREEnv, Action, ActionType
 from prompts import PROMPTS, SCENARIO_MESSAGES
 
 # --- Configuration ---
-MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" 
+# MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" 
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -176,17 +177,24 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         
         # --- L1_Triage Workflow ---
         elif role == "L1_Triage":
+            # Detect if investigation was already done (prompt contains findings)
+            already_investigated = any(kw in prompt_lower for kw in 
+                ["logs show", "found:", "identified", "reports:", "root cause", "diagnostic:"])
+            
             if action_type == "LIST_SERVICES":
-                # L1 should always be willing to list services
-                reward += 0.45  # Strong reward for diagnostic action
-                if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
-                    reward += 0.15  # Extra for matching context
+                if already_investigated:
+                    reward -= 0.20  # Don't repeat diagnostics, report findings!
+                else:
+                    reward += 0.45  # Correct first step
+                    if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
+                        reward += 0.15
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
-                if service_id in VALID_SERVICES:
+                if already_investigated:
+                    reward -= 0.20  # Don't keep investigating, report to IC!
+                elif service_id in VALID_SERVICES:
                     reward += 0.45  # Correct diagnostic action
-                    # Extra if service matches context
                     service_mentioned = service_id.replace("-", "").lower()
                     if service_mentioned in prompt_lower.replace("-", ""):
                         reward += 0.20  # Investigating the right service
@@ -196,8 +204,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     reward -= 0.20  # Missing service_id
                     
             elif action_type == "MESSAGE_CHANNEL":
-                # L1 messaging is okay but not as good as investigating
-                reward += 0.10
+                target = action_dict.get("target", "")
+                if already_investigated and target == "IC":
+                    reward += 0.40  # Correct: report findings to IC
+                elif not already_investigated:
+                    reward -= 0.15  # Should investigate first before reporting
+                else:
+                    reward += 0.10
                     
             elif action_type == "CLOSE_INCIDENT":
                 reward -= 0.60  # L1 should NEVER close incidents
@@ -207,14 +220,18 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         
         # --- L2_DB_SME Workflow ---
         elif role == "L2_DB_SME":
+            # Detect if fix was already applied
+            fix_already_applied = any(kw in prompt_lower for kw in 
+                ["restarted", "scaled", "fix applied", "recovered", "back online"])
+            
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
-                if service_id in VALID_SERVICES:
+                if fix_already_applied:
+                    reward -= 0.25  # Don't restart again, report to IC!
+                elif service_id in VALID_SERVICES:
                     reward += 0.45  # Correct fix action
-                    # Extra if context mentions crash/error/down
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
                         reward += 0.20
-                    # Extra if service matches
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
                         reward += 0.15
                 elif service_id:
@@ -226,15 +243,16 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 service_id = action_dict.get("service_id", "")
                 cpu_value = action_dict.get("cpu_value")
                 
-                if service_id in VALID_SERVICES and isinstance(cpu_value, int):
+                if fix_already_applied:
+                    reward -= 0.25  # Don't scale again, report to IC!
+                elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
-                        reward += 0.45  # Correct scale value
+                        reward += 0.45
                     elif cpu_value >= 1024:
                         reward += 0.20
                     else:
-                        reward -= 0.10  # Too low to help
+                        reward -= 0.10
                         
-                    # Context match
                     if any(kw in prompt_lower for kw in ["cpu", "resource", "overload", "performance", "latency", "scale"]):
                         reward += 0.20
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
@@ -243,8 +261,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     reward -= 0.20  # Missing required fields
                     
             elif action_type == "MESSAGE_CHANNEL":
-                # L2 should fix, not just message
-                reward -= 0.10
+                target = action_dict.get("target", "")
+                if fix_already_applied and target == "IC":
+                    reward += 0.40  # Correct: report fix completion to IC
+                elif not fix_already_applied:
+                    reward -= 0.20  # Should fix first, then report
+                else:
+                    reward += 0.05
                     
             elif action_type == "CLOSE_INCIDENT":
                 reward -= 0.60  # L2 should NEVER close incidents
