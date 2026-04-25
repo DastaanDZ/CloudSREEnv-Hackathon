@@ -249,7 +249,20 @@ class CloudSREEnv:
         if action.action_type == ActionType.INVALID_FORMAT:
             return -0.5, {"syntax_penalty": -0.5}, "Invalid JSON format."
 
-        # 2. Tool-Use Rubric (Reward discovery and communication)
+        # 2. Duplicate Action Penalty (penalize same action by same agent)
+        if len(self.action_history) >= 1:
+            last_action = self.action_history[-1]
+            is_duplicate = (
+                last_action.action_type == action.action_type and
+                last_action.agent_id == action.agent_id and
+                last_action.service_id == action.service_id
+            )
+            if is_duplicate:
+                reward -= 0.15
+                breakdown["duplicate_penalty"] = -0.15
+                reason = "Repeated same action."
+
+        # 3. Tool-Use Rubric (Reward discovery and communication)
         if action.action_type in [ActionType.LIST_SERVICES, ActionType.GET_LOGS]:
             reward += 0.05
             breakdown["tool_discovery"] = 0.05
@@ -260,7 +273,7 @@ class CloudSREEnv:
             breakdown["collaboration"] = 0.1
             reason = "Communicated in channel."
 
-        # 3. RBAC Rubric (Strictly enforce roles)
+        # 4. RBAC Rubric (Strictly enforce roles)
         if action.action_type in [ActionType.RESTART, ActionType.SCALE]:
             if action.agent_id != "L2_DB_SME":
                 return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
@@ -269,7 +282,7 @@ class CloudSREEnv:
                 breakdown["authorized_action"] = 0.2
                 reason = "Executed authorized modification."
 
-        # 4. Time Penalty (Encourages efficiency)
+        # 5. Time Penalty (Encourages efficiency)
         time_penalty = -0.02 * self.steps_taken
         reward += time_penalty
         breakdown["time_penalty"] = time_penalty

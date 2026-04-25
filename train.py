@@ -31,24 +31,32 @@ VALID_TARGETS = {"IC", "L1_Triage", "L2_DB_SME"}
 # ---------------------------------------------------------------------------
 # 1. Workflow-Aware Reward Function for Multi-Agent SRE
 # ---------------------------------------------------------------------------
+# Reward weighting: Adjusts based on prompt stage
+# Early-stage (fresh context): Trust env more (70% env, 30% manual)
+# Later-stage (accumulated context): Trust manual more (30% env, 70% manual)
+#   because fresh env doesn't reflect actions described in prompt
+ENV_WEIGHT_EARLY = 0.70
+MANUAL_WEIGHT_EARLY = 0.30
+ENV_WEIGHT_LATER = 0.30
+MANUAL_WEIGHT_LATER = 0.70
+
 def sre_rubric_reward(prompts, completions, **kwargs):
     """
-    Workflow-aware reward function that teaches correct SRE behavior patterns.
+    Hybrid reward function: 70% environment ground-truth + 30% workflow heuristics.
     
-    Key insight: Single-turn training must encode multi-turn workflow knowledge
-    by heavily rewarding/penalizing actions based on scenario context.
+    Environment provides:
+    - RBAC enforcement, tool discovery bonuses, collaboration rewards, task completion
     
-    Workflow rules encoded:
-    - L1_Triage MUST use LIST_SERVICES or GET_LOGS before MESSAGE_CHANNEL
-    - IC should delegate to L2_DB_SME when error/fix is mentioned
-    - Only IC should use CLOSE_INCIDENT
-    - L2_DB_SME should use RESTART/SCALE, not just MESSAGE_CHANNEL
+    Manual heuristics provide:
+    - Context-aware workflow guidance (initial alert vs after investigation)
+    - Format/syntax checking
     """
     rewards = []
     
     for prompt_str, completion in zip(prompts, completions):
         raw_text = completion[0]['content'] if isinstance(completion, list) else completion
-        reward = 0.0
+        manual_reward = 0.0  # Accumulates hand-written heuristic rewards
+        env_reward = 0.0     # Accumulates environment rewards
         
         # =====================================================================
         # STAGE 1: Hard penalties for refusals (-1.0 immediate return)
@@ -60,74 +68,74 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             continue
         
         # =====================================================================
-        # STAGE 2: Prose/verbosity penalties
+        # STAGE 2: Prose/verbosity penalties (manual)
         # =====================================================================
         prose_indicators = ["**", "Here's", "Let me", "Sure,", "Certainly", 
                           "```", "I will", "I'll", "First,", "To "]
         prose_count = sum(1 for p in prose_indicators if p in raw_text)
-        reward -= prose_count * 0.1
+        manual_reward -= prose_count * 0.1
         
         # =====================================================================
-        # STAGE 3: JSON structure detection
+        # STAGE 3: JSON structure detection (manual)
         # =====================================================================
         if "{" not in raw_text or "}" not in raw_text:
-            rewards.append(max(-1.0, reward - 0.5))
+            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.5))
             continue
         
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if not json_match:
-            rewards.append(max(-1.0, reward - 0.4))
+            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.4))
             continue
         
         json_str = json_match.group(0)
         json_start_pos = json_match.start()
         
-        # Strong bonus for JSON appearing immediately (position 0-5)
+        # Bonus for JSON appearing early (manual)
         if json_start_pos <= 5:
-            reward += 0.15
+            manual_reward += 0.15
         elif json_start_pos <= 20:
-            reward += 0.08
+            manual_reward += 0.08
         else:
-            reward -= 0.05 * (json_start_pos / 50)
+            manual_reward -= 0.05 * (json_start_pos / 50)
         
         # =====================================================================
-        # STAGE 4: JSON parsing and compactness
+        # STAGE 4: JSON parsing and compactness (manual)
         # =====================================================================
         try:
             action_dict = json.loads(json_str)
-            reward += 0.15
+            manual_reward += 0.15
         except json.JSONDecodeError:
-            rewards.append(max(-1.0, reward - 0.3))
+            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.3))
             continue
         
-        # Strongly reward compact JSON
+        # Reward compact JSON (manual)
         json_length = len(json_str)
         if json_length < 60:
-            reward += 0.12
+            manual_reward += 0.12
         elif json_length < 100:
-            reward += 0.06
+            manual_reward += 0.06
         elif json_length > 150:
-            reward -= 0.10
+            manual_reward -= 0.10
         
         if '\n' not in json_str:
-            reward += 0.05
+            manual_reward += 0.05
         
         # =====================================================================
-        # STAGE 5: Action type validation
+        # STAGE 5: Action type validation (manual)
         # =====================================================================
         action_type = action_dict.get("action_type", "")
         
         if not action_type:
-            rewards.append(max(-1.0, reward - 0.3))
+            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.3))
             continue
         
         if action_type in VALID_ACTIONS:
-            reward += 0.10
+            manual_reward += 0.10
         else:
-            reward -= 0.20
+            manual_reward -= 0.20
         
         # =====================================================================
-        # STAGE 6: WORKFLOW-AWARE SCORING (Critical for learning correct behavior)
+        # STAGE 6: WORKFLOW-AWARE SCORING (manual heuristics)
         # =====================================================================
         role = _detect_role_from_prompt(prompt_str)
         prompt_lower = prompt_str.lower()
@@ -141,160 +149,169 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         if role == "IC":
             if action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
-                message = action_dict.get("message", "")
                 
                 if is_initial_alert:
-                    # On initial alert, IC MUST delegate to L1
                     if target == "L1_Triage":
-                        reward += 0.50  # Strong reward for correct delegation
+                        manual_reward += 0.50
                     elif target == "L2_DB_SME":
-                        reward += 0.15  # Acceptable but skipping investigation
+                        manual_reward += 0.15
                     else:
-                        reward -= 0.10
-                        
+                        manual_reward -= 0.10
                 elif is_after_investigation:
-                    # After L1 reports, IC should delegate to L2
                     if target == "L2_DB_SME":
-                        reward += 0.50  # Correct: delegate fix
+                        manual_reward += 0.50
                     elif target == "L1_Triage":
-                        reward -= 0.15  # Wrong: already have diagnosis
+                        manual_reward -= 0.15
                 else:
-                    reward += 0.20  # Generic delegation is okay
+                    manual_reward += 0.20
                         
             elif action_type == "CLOSE_INCIDENT":
-                # CLOSE_INCIDENT only appropriate after fix confirmed
                 if is_after_fix:
-                    reward += 0.45  # Correct timing
+                    manual_reward += 0.45
                 elif is_initial_alert:
-                    reward -= 0.60  # VERY WRONG: closing on first alert!
+                    manual_reward -= 0.60
                 elif is_after_investigation:
-                    reward -= 0.40  # Wrong: need to fix first
+                    manual_reward -= 0.40
                 else:
-                    reward -= 0.30  # Probably premature
+                    manual_reward -= 0.30
                     
             elif action_type in ["LIST_SERVICES", "GET_LOGS", "RESTART", "SCALE"]:
-                reward -= 0.30  # IC shouldn't do these directly
+                manual_reward -= 0.30
         
         # --- L1_Triage Workflow ---
         elif role == "L1_Triage":
-            # Detect if investigation was already done (match ACTUAL env output format)
-            already_investigated = any(kw in prompt_lower for kw in 
-                ["=== logs:", "obs:", "[error]", "[warn]", "oomkilled", "crashloopbackoff",
-                 "logs show", "found:", "identified", "reports:", "root cause", "cpu usage"])
+            # More precise detection of investigation stages:
+            # - has_service_list: After LIST_SERVICES (saw service table)
+            # - has_log_content: After GET_LOGS (saw actual log entries)
+            has_service_list = any(kw in prompt_lower for kw in ["running", "error      0ms", "obs:"])
+            has_log_content = any(kw in prompt_lower for kw in 
+                ["=== logs:", "[error]", "[warn]", "oomkilled", "crashloopbackoff",
+                 "cpu usage", "rps=", "503 service unavailable"])
+            has_reported = any(kw in prompt_lower for kw in 
+                ["found:", "identified", "reports:", "root cause", "report findings"])
             
             if action_type == "LIST_SERVICES":
-                if already_investigated:
-                    reward -= 0.40  # STRONG penalty: stop repeating, report to IC!
+                if has_log_content or has_reported:
+                    # Already have logs/findings - don't list again, report to IC!
+                    manual_reward -= 0.40
+                elif has_service_list:
+                    # Already listed services - should GET_LOGS now, not list again
+                    manual_reward -= 0.25
                 else:
-                    reward += 0.45  # Correct first step
+                    # Fresh investigation - LIST_SERVICES is correct first step
+                    manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["status", "cluster", "what's", "investigate", "check"]):
-                        reward += 0.15
+                        manual_reward += 0.15
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
-                if already_investigated:
-                    reward -= 0.40  # STRONG penalty: stop investigating, report to IC!
+                if has_log_content or has_reported:
+                    # Already have log content - don't keep getting logs, report to IC!
+                    manual_reward -= 0.40
                 elif service_id in VALID_SERVICES:
-                    reward += 0.45  # Correct diagnostic action
-                    service_mentioned = service_id.replace("-", "").lower()
-                    if service_mentioned in prompt_lower.replace("-", ""):
-                        reward += 0.20  # Investigating the right service
+                    # GET_LOGS is correct after LIST_SERVICES or at start
+                    manual_reward += 0.45
+                    if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
+                        manual_reward += 0.20
                 elif service_id:
-                    reward -= 0.15  # Hallucinated service name
+                    manual_reward -= 0.15
                 else:
-                    reward -= 0.20  # Missing service_id
+                    manual_reward -= 0.20
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
-                if already_investigated and target == "IC":
-                    reward += 0.70  # STRONG reward: report findings to IC after investigation
-                elif not already_investigated:
-                    reward -= 0.10  # Should investigate first before reporting
+                if has_log_content and target == "IC":
+                    # Have log content - correct to report findings to IC
+                    manual_reward += 0.70
+                elif has_reported:
+                    # Already reported - don't message again
+                    manual_reward -= 0.20
+                elif not has_service_list and not has_log_content:
+                    # Haven't investigated at all - should investigate first
+                    manual_reward -= 0.15
                 else:
-                    reward += 0.15
+                    manual_reward += 0.10
                     
             elif action_type == "CLOSE_INCIDENT":
-                reward -= 0.60  # L1 should NEVER close incidents
+                manual_reward -= 0.60
                 
             elif action_type in ["RESTART", "SCALE"]:
-                reward -= 0.50  # L1 has no write permissions - RBAC violation
+                manual_reward -= 0.50
         
         # --- L2_DB_SME Workflow ---
         elif role == "L2_DB_SME":
-            # Detect if fix was already applied
             fix_already_applied = any(kw in prompt_lower for kw in 
                 ["restarted", "scaled", "fix applied", "recovered", "back online"])
             
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
-                    reward -= 0.25  # Don't restart again, report to IC!
+                    manual_reward -= 0.25
                 elif service_id in VALID_SERVICES:
-                    reward += 0.45  # Correct fix action
+                    manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
-                        reward += 0.20
+                        manual_reward += 0.20
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
-                        reward += 0.15
+                        manual_reward += 0.15
                 elif service_id:
-                    reward -= 0.10  # Wrong service
+                    manual_reward -= 0.10
                 else:
-                    reward -= 0.25  # Missing service_id
+                    manual_reward -= 0.25
                     
             elif action_type == "SCALE":
                 service_id = action_dict.get("service_id", "")
                 cpu_value = action_dict.get("cpu_value")
                 
                 if fix_already_applied:
-                    reward -= 0.25  # Don't scale again, report to IC!
+                    manual_reward -= 0.25
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
-                        reward += 0.45
+                        manual_reward += 0.45
                     elif cpu_value >= 1024:
-                        reward += 0.20
+                        manual_reward += 0.20
                     else:
-                        reward -= 0.10
-                        
+                        manual_reward -= 0.10
                     if any(kw in prompt_lower for kw in ["cpu", "resource", "overload", "performance", "latency", "scale"]):
-                        reward += 0.20
+                        manual_reward += 0.20
                     if service_id.replace("-", "").lower() in prompt_lower.replace("-", ""):
-                        reward += 0.15
+                        manual_reward += 0.15
                 else:
-                    reward -= 0.20  # Missing required fields
+                    manual_reward -= 0.20
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
                 if fix_already_applied and target == "IC":
-                    reward += 0.40  # Correct: report fix completion to IC
+                    manual_reward += 0.40
                 elif not fix_already_applied:
-                    reward -= 0.20  # Should fix first, then report
+                    manual_reward -= 0.20
                 else:
-                    reward += 0.05
+                    manual_reward += 0.05
                     
             elif action_type == "CLOSE_INCIDENT":
-                reward -= 0.60  # L2 should NEVER close incidents
+                manual_reward -= 0.60
                 
             elif action_type in ["LIST_SERVICES", "GET_LOGS"]:
-                reward -= 0.25  # L2 should act, not investigate
+                manual_reward -= 0.25
         
         # =====================================================================
-        # STAGE 7: Field completeness validation
+        # STAGE 7: Field completeness validation (manual)
         # =====================================================================
         if action_type in ["GET_LOGS", "RESTART", "SCALE"]:
             if not action_dict.get("service_id"):
-                reward -= 0.15
+                manual_reward -= 0.15
                 
         if action_type == "SCALE":
             if not isinstance(action_dict.get("cpu_value"), int):
-                reward -= 0.15
+                manual_reward -= 0.15
                 
         if action_type == "MESSAGE_CHANNEL":
             if not action_dict.get("target"):
-                reward -= 0.15
+                manual_reward -= 0.15
             if not action_dict.get("message"):
-                reward -= 0.10
+                manual_reward -= 0.10
         
         # =====================================================================
-        # STAGE 8: Environment execution for ground-truth validation
+        # STAGE 8: Environment execution (70% of total reward)
         # =====================================================================
         try:
             action_dict["agent_id"] = role
@@ -312,26 +329,35 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             action = Action(**action_dict)
             _, reward_obj, done, _ = env.step(action)
             
-            # Add environment's dense rewards (scaled to be supplementary)
+            # Accumulate ALL environment rewards (will be weighted at 70%)
             for component, value in reward_obj.breakdown.items():
-                reward += value * 0.15  # Scaled contribution from env
+                env_reward += value
             
-            # Bonus if action actually completes the task
+            # Task completion is a strong env signal
             if done and reward_obj.value > 0:
-                reward += 0.25
-                
-            # Environment's RBAC penalties are strong signals
-            if "rbac_penalty" in reward_obj.breakdown:
-                reward += reward_obj.breakdown["rbac_penalty"] * 0.5  # Amplify RBAC violation
+                env_reward += 0.5
                 
         except Exception:
-            # If action can't be executed (invalid schema), small penalty
-            reward -= 0.05
+            # If action can't be executed, env gives negative signal
+            env_reward -= 0.3
         
         # =====================================================================
-        # Final: Clamp to [-1.0, 1.0]
+        # FINAL: Combine rewards with stage-aware weighting
         # =====================================================================
-        rewards.append(max(-1.0, min(1.0, reward)))
+        # Detect if prompt is early-stage (env state matches) or later-stage (env state is stale)
+        is_later_stage = any(kw in prompt_lower for kw in [
+            "obs:", "=== logs:", "new message from l1", "new message from l2",
+            "restarted", "scaled", "fix applied", "l1_triage reports", "l2_db_sme"
+        ])
+        
+        if is_later_stage:
+            # Later-stage: Trust manual heuristics more (env state doesn't match prompt context)
+            total_reward = (env_reward * ENV_WEIGHT_LATER) + (manual_reward * MANUAL_WEIGHT_LATER)
+        else:
+            # Early-stage: Trust env more (fresh env matches INITIAL ALERT context)
+            total_reward = (env_reward * ENV_WEIGHT_EARLY) + (manual_reward * MANUAL_WEIGHT_EARLY)
+        
+        rewards.append(max(-1.0, min(1.0, total_reward)))
     
     return rewards
 
