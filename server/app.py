@@ -134,6 +134,8 @@ class MockCloud:
             "inventory-svc": "payment-db",
             "notification-worker": "inventory-svc"
         }
+        # Preserve scenario-set error_messages, only clear cascade-generated ones
+        preserved = {svc.id: svc.error_message for svc in self.services.values() if svc.error_message}
         for svc in self.services.values():
             svc.error_message = ""
             if svc.status == "Running" and svc.id != "auth-api":
@@ -149,6 +151,12 @@ class MockCloud:
             elif provider.latency_ms > 200:
                 dep_svc.latency_ms += int(provider.latency_ms * 0.5)
                 dep_svc.error_message = f"Warning: Upstream {provider_id} is slow."
+
+        # Restore scenario-set error_messages that weren't overwritten by cascade
+        for svc_id, msg in preserved.items():
+            svc = self.services.get(svc_id)
+            if svc and not svc.error_message:
+                svc.error_message = msg
 
 class CloudSREEnv:
     def __init__(self):
