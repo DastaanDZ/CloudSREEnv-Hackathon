@@ -113,6 +113,42 @@ def task1_has_required_evidence(env: CloudSREEnv, task_id: str) -> bool:
         for a in env.action_history
     )
 
+def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
+    """Return the required IC->L2 action once L1 evidence exists."""
+    if "task2" in task_id and any(
+        a.action_type == ActionType.GET_LOGS and a.service_id == "payment-db"
+        for a in env.action_history
+    ):
+        return {
+            "action_type": "MESSAGE_CHANNEL",
+            "target": "L2_DB_SME",
+            "message": "Root cause is payment-db CrashLoopBackOff/OOMKilled. Restart payment-db.",
+        }
+    if "task3" in task_id and any(
+        a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api"
+        for a in env.action_history
+    ):
+        return {
+            "action_type": "MESSAGE_CHANNEL",
+            "target": "L2_DB_SME",
+            "message": "Root cause is auth-api CPU saturation. Scale auth-api to 2048 CPU.",
+        }
+    return None
+
+def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
+    """True once the task-specific remediation action has already happened."""
+    if "task2" in task_id:
+        return any(
+            a.action_type == ActionType.RESTART and a.service_id == "payment-db"
+            for a in env.action_history
+        )
+    if "task3" in task_id:
+        return any(
+            a.action_type == ActionType.SCALE and a.service_id == "auth-api"
+            for a in env.action_history
+        )
+    return False
+
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
     logger.info(f"========== EVALUATING SCENARIO: {task_id} ==========")
     obs = env.reset(task_id=task_id)
@@ -195,6 +231,53 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
             agent_histories[current_agent] += (
                 "\n[SYSTEM] Task1 is certificate RCA only. Do NOT delegate to L2_DB_SME and do NOT remediate. "
                 "Close now with exactly: {\"action_type\": \"CLOSE_INCIDENT\"}"
+            )
+            continue
+
+        required_l2 = required_l2_delegation(env, task_id)
+        if (current_agent == "IC"
+                and required_l2
+                and not l2_fix_applied(env, task_id)
+                and (action.action_type != ActionType.MESSAGE_CHANNEL or action.target != "L2_DB_SME")):
+            logger.warning("IC has L1 evidence; forcing delegation to L2.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] L1 has already found the root cause. "
+                f"Your next action must be exactly: {json.dumps(required_l2)}"
+            )
+            continue
+
+        if (current_agent == "L2_DB_SME"
+                and l2_fix_applied(env, task_id)
+                and action.action_type in (ActionType.RESTART, ActionType.SCALE)):
+            logger.warning("L2 fix already applied; blocking repeated remediation.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] Fix already applied. Do not repeat RESTART or SCALE. "
+                "Report completion with exactly: "
+                "{\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
+            )
+            continue
+
+        if (current_agent == "IC"
+                and l2_fix_applied(env, task_id)
+                and action.action_type == ActionType.MESSAGE_CHANNEL):
+            logger.warning("L2 fix is complete; forcing incident closure.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] L2 has already applied the fix. "
+                "Close now with exactly: {\"action_type\": \"CLOSE_INCIDENT\"}"
+            )
+            continue
+
+        if (current_agent == "L1_Triage"
+                and action.action_type == ActionType.GET_LOGS
+                and any(a.action_type == ActionType.GET_LOGS and a.service_id == action.service_id for a in env.action_history)):
+            logger.warning("L1 already has logs; blocking repeated GET_LOGS.")
+            recent_actions[current_agent].pop()
+            agent_histories[current_agent] += (
+                "\n[SYSTEM] You already gathered these logs. "
+                "Report findings to IC with MESSAGE_CHANNEL."
             )
             continue
 

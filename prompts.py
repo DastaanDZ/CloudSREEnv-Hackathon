@@ -80,12 +80,15 @@ SCENARIO_MESSAGES = {
         # Task2: payment-db crash (needs RESTART)
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.",
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: Root cause found. payment-db is in CrashLoopBackOff with OOMKilled error.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: payment-db logs show OOMKilled and CrashLoopBackOff. This requires L2 remediation.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] payment-db status transition to Error detected.\nNew message from L1_Triage: I already checked logs. Root cause is payment-db CrashLoopBackOff/OOMKilled. Delegate restart to L2_DB_SME.",
         "INITIAL ALERT:\n[SYSTEM ALERT] payment-db Error.\nNew message from L1_Triage: payment-db OOMKilled.\nNew message from L2_DB_SME: Fix applied. payment-db restarted and is now Running.",
         
         # Task3: High latency (needs SCALE) - IC must delegate to L2 after L1 report
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency (850ms) detected on auth-api.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api at 99.8% CPU. Needs scaling.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: auth-api CPU overloaded, latency 850ms. Needs scaling to 2048 CPU.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] High latency on auth-api.\nNew message from L1_Triage: I already checked logs. Root cause is auth-api CPU saturation under high RPS. Delegate scaling to L2_DB_SME.",
         "INITIAL ALERT:\n[SYSTEM ALERT] High latency.\nNew message from L1_Triage: auth-api overloaded.\nNew message from L2_DB_SME: auth-api scaled to 2048 CPU. Latency resolved.",
     ],
     "L1_Triage": [
@@ -122,10 +125,12 @@ SCENARIO_MESSAGES = {
         "New message from IC: L1 found payment-db OOMKilled. Apply RESTART to payment-db.",
         "New message from IC: Database crashed. Fix payment-db immediately.",
         "New message from IC: Fix the database.\nObs: payment-db is in Error state with OOMKilled.",
+        "New message from IC: Restart payment-db to recover from CrashLoopBackOff.\nObs: [OK] payment-db restarted by L2_DB_SME.",
         
         # Task3: auth-api scaling fix
         "New message from IC: auth-api needs more resources. Scale it to 2048 CPU.",
         "New message from IC: High CPU on auth-api causing latency. Scale auth-api.",
         "New message from IC: Resolve the performance issue.\nObs: auth-api at 99.8% CPU, latency 850ms.",
+        "New message from IC: Scale auth-api to 2048 CPU to resolve latency.\nObs: [OK] auth-api scaled to 2048m CPU.",
     ],
 }

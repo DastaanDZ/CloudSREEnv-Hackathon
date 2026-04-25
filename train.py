@@ -4,6 +4,7 @@ train.py — Hugging Face TRL GRPO Training Loop for CloudSREEnv (Colab T4 Optim
 
 import json
 import logging
+import random
 import re
 import torch
 from datasets import Dataset
@@ -34,9 +35,16 @@ def extract_first_json_object(raw_text: str) -> tuple[dict | None, int]:
 # MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" 
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("GRPOTrainer")
+
+def seed_everything(seed: int = SEED) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # Valid services in the environment (for semantic scoring)
 VALID_SERVICES = {"auth-api", "payment-db", "inventory-svc", "notification-worker"}
@@ -144,16 +152,38 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         role = _detect_role_from_prompt(prompt_str)
         prompt_lower = prompt_str.lower()
         
-        # Detect context phases
+        # Detect context phases. IC histories always keep the original
+        # INITIAL ALERT, so explicit later-state evidence must drive scoring.
+        has_l1_message = "new message from l1_triage" in prompt_lower
+        task1_cert_evidence = (
+            has_l1_message
+            and "auth-api" in prompt_lower
+            and any(kw in prompt_lower for kw in ["certificate", "expired", "tls", "no local fix"])
+        )
+        task2_crash_evidence = (
+            has_l1_message
+            and "payment-db" in prompt_lower
+            and any(kw in prompt_lower for kw in ["oomkilled", "crashloopbackoff", "crash", "error"])
+        )
+        task3_perf_evidence = (
+            has_l1_message
+            and "auth-api" in prompt_lower
+            and any(kw in prompt_lower for kw in ["cpu", "rps", "latency", "scale", "saturated", "overloaded"])
+        )
+        has_fixable_l1_evidence = task2_crash_evidence or task3_perf_evidence
         is_initial_alert = any(kw in prompt_lower for kw in ["initial alert", "system alert", "alert:", "escalation:", "incident:"])
-        is_after_investigation = any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
+        is_after_investigation = (
+            any(kw in prompt_lower for kw in ["l1_triage reports", "l1_triage found", "l1_triage identified", "l1_triage diagnostic", "root cause"])
+            or task1_cert_evidence
+            or has_fixable_l1_evidence
+        )
         is_after_fix = any(kw in prompt_lower for kw in [
             "l2_db_sme confirms", "l2_db_sme reports", "new message from l2_db_sme",
             "all services now healthy", "fix successfully", "fix applied",
             "restarted and is now", "restarted.", "scaled to"
         ])
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
-        is_investigation_only = has_cert_log_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
+        is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
         
         # --- IC Workflow ---
         if role == "IC":
@@ -163,22 +193,30 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 # Phase priority matters because every IC history keeps the
                 # original INITIAL ALERT. Later-state evidence must win.
                 if is_after_fix:
-                    manual_reward -= 0.65
+                    manual_reward -= 0.85
+                    if target in ["L1_Triage", "L2_DB_SME"]:
+                        manual_reward -= 0.10
+                elif is_investigation_only:
                     if target == "L2_DB_SME":
-                        manual_reward -= 0.20
-                elif is_after_investigation:
-                    if is_investigation_only:
-                        if target == "L2_DB_SME":
-                            manual_reward -= 0.45
-                        else:
-                            manual_reward -= 0.10
+                        manual_reward -= 0.90
+                    elif target == "L1_Triage":
+                        manual_reward -= 0.65
                     else:
-                        if target == "L2_DB_SME":
-                            manual_reward += 0.55
-                        elif target == "L1_Triage":
-                            manual_reward -= 0.35
-                        else:
-                            manual_reward -= 0.10
+                        manual_reward -= 0.30
+                elif has_fixable_l1_evidence:
+                    if target == "L2_DB_SME":
+                        manual_reward += 0.90
+                    elif target == "L1_Triage":
+                        manual_reward -= 0.85
+                    else:
+                        manual_reward -= 0.35
+                elif is_after_investigation:
+                    if target == "L2_DB_SME":
+                        manual_reward += 0.65
+                    elif target == "L1_Triage":
+                        manual_reward -= 0.55
+                    else:
+                        manual_reward -= 0.20
                 elif is_initial_alert:
                     if target == "L1_Triage":
                         manual_reward += 0.50
@@ -191,9 +229,11 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         
             elif action_type == "CLOSE_INCIDENT":
                 if is_after_fix:
-                    manual_reward += 0.85
+                    manual_reward += 0.95
                 elif is_after_investigation and is_investigation_only:
-                    manual_reward += 0.75
+                    manual_reward += 0.90
+                elif has_fixable_l1_evidence:
+                    manual_reward -= 0.75
                 elif is_initial_alert:
                     manual_reward -= 0.60
                 elif is_after_investigation:
@@ -399,56 +439,57 @@ def _prepare_env_for_prompt(env: CloudSREEnv, prompt_lower: str) -> None:
     This makes the env's internal state (cloud status, action_history, steps_taken)
     match what the prompt describes, so scoring is accurate.
     """
-    # Replay LIST_SERVICES if prompt contains service listing output
-    if any(svc in prompt_lower for svc in ["auth-api", "payment-db", "inventory-svc"]) and "running" in prompt_lower:
+    def already_replayed(action_type: ActionType, service_id: str | None = None) -> bool:
+        return any(
+            a.action_type == action_type and (service_id is None or a.service_id == service_id)
+            for a in env.action_history
+        )
+
+    def replay_once(action: Action) -> None:
+        if already_replayed(action.action_type, action.service_id):
+            return
         try:
-            env.step(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
+            env.step(action)
         except Exception:
             pass
+
+    # Replay LIST_SERVICES if prompt contains service listing output
+    if any(svc in prompt_lower for svc in ["auth-api", "payment-db", "inventory-svc"]) and "running" in prompt_lower:
+        replay_once(Action(action_type=ActionType.LIST_SERVICES, agent_id="L1_Triage"))
     
     # Replay GET_LOGS if prompt contains actual log output (=== Logs: <svc> ===)
     if "=== logs:" in prompt_lower or "oomkilled" in prompt_lower:
         if "payment-db" in prompt_lower:
-            try:
-                env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
-            except Exception:
-                pass
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
         if "=== logs: auth-api ===" in prompt_lower:
-            try:
-                env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
-            except Exception:
-                pass
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
+    
+    # IC prompts often contain L1 summaries rather than raw logs. Replay the
+    # implied read-only evidence so IC routing actions get accurate env scores.
+    if "new message from l1_triage" in prompt_lower:
+        if "payment-db" in prompt_lower and any(kw in prompt_lower for kw in ["oomkilled", "crashloopbackoff", "crash", "error"]):
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="payment-db"))
+        if "auth-api" in prompt_lower and any(kw in prompt_lower for kw in ["cpu", "rps", "latency", "saturated", "overloaded"]):
+            replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
     
     # IC only sees L1's RCA report, not the raw L1 action history. Recreate the
     # required task1 evidence so CLOSE_INCIDENT is scored like inference.
     if ("new message from l1_triage" in prompt_lower
             and "auth-api" in prompt_lower
             and any(kw in prompt_lower for kw in ["expired tls certificate", "expired upstream certificate", "no local fix"])):
-        try:
-            env.step(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
-        except Exception:
-            pass
+        replay_once(Action(action_type=ActionType.GET_LOGS, agent_id="L1_Triage", service_id="auth-api"))
     
     # Replay RESTART if prompt says service was restarted (L2_DB_SME is authorized)
-    if "restarted" in prompt_lower:
+    if "restarted" in prompt_lower or ("fix applied" in prompt_lower and "payment-db" in prompt_lower):
         if "payment-db" in prompt_lower:
-            try:
-                env.step(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id="payment-db"))
-            except Exception:
-                pass
+            replay_once(Action(action_type=ActionType.RESTART, agent_id="L2_DB_SME", service_id="payment-db"))
     
     # Replay SCALE if prompt says service was scaled (L2_DB_SME is authorized)
-    if "scaled" in prompt_lower:
+    if "scaled" in prompt_lower or ("fix applied" in prompt_lower and "auth-api" in prompt_lower):
         if "auth-api" in prompt_lower:
-            try:
-                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="auth-api", cpu_value=2048))
-            except Exception:
-                pass
+            replay_once(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="auth-api", cpu_value=2048))
         if "payment-db" in prompt_lower:
-            try:
-                env.step(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="payment-db", cpu_value=4096))
-            except Exception:
-                pass
+            replay_once(Action(action_type=ActionType.SCALE, agent_id="L2_DB_SME", service_id="payment-db", cpu_value=4096))
 
 
 def _detect_role_from_prompt(prompt_str: str) -> str:
@@ -558,8 +599,8 @@ def build_dataset(num_samples: int = 800):
     
     roles = list(PROMPTS.keys())
     
-    # Part 1: Static scenario messages (60% of dataset)
-    static_samples = int(num_samples * 0.6)
+    # Part 1: Static scenario messages (40% of dataset)
+    static_samples = int(num_samples * 0.4)
     for _ in range(static_samples):
         role_key = roles[torch.randint(0, len(roles), (1,)).item()]
         messages_for_role = SCENARIO_MESSAGES[role_key]
@@ -577,12 +618,13 @@ def build_dataset(num_samples: int = 800):
         )
         prompts_list.append(prompt_str)
     
-    # Part 2: Synthetic trajectories (40% of dataset)
+    # Part 2: Synthetic trajectories (60% of dataset)
     trajectory_samples = num_samples - static_samples
     num_episodes = max(1, (trajectory_samples + 5) // 6)  # Generate enough turns, then slice to target.
     trajectories = generate_synthetic_trajectories(num_episodes)
     
-    for role_key, user_msg in trajectories[:trajectory_samples]:
+    selected_trajectories = trajectories[:trajectory_samples]
+    for role_key, user_msg in selected_trajectories:
         messages = [
             {"role": "system", "content": PROMPTS[role_key]},
             {"role": "user", "content": user_msg}
@@ -596,16 +638,16 @@ def build_dataset(num_samples: int = 800):
         prompts_list.append(prompt_str)
     
     # Shuffle to mix static and trajectory samples
-    import random
     random.shuffle(prompts_list)
     
-    logger.info(f"Built dataset with {len(prompts_list)} examples ({static_samples} static + {len(trajectories)} trajectory)")
+    logger.info(f"Built dataset with {len(prompts_list)} examples ({static_samples} static + {len(selected_trajectories)} trajectory)")
     return Dataset.from_dict({"prompt": prompts_list})
 
 # ---------------------------------------------------------------------------
 # 3. The Main Training Loop
 # ---------------------------------------------------------------------------
 def main():
+    seed_everything()
     logger.info(f"Loading {MODEL_NAME} onto {DEVICE}...")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -619,7 +661,7 @@ def main():
     ).to(DEVICE)
     
     # Build diverse training dataset
-    dataset = build_dataset(num_samples=800)
+    dataset = build_dataset(num_samples=1200)
 
     peft_config = LoraConfig(
         r=16,
