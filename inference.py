@@ -38,6 +38,8 @@ EVAL_MODE = "TRAINED"
 # Raw evaluation disables corrective hints, forced delegation, and auto-closing.
 USE_GUARDRAILS = False
 EVAL_STYLE = "GUARDED" if USE_GUARDRAILS else "RAW"
+LOG_RAW_REPLIES = True
+LOG_RAW_REPLY_TURNS = 6
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
@@ -67,7 +69,7 @@ def load_eval_model(mode="TRAINED"):
     if mode == "TRAINED":
         if not os.path.exists(TRAINED_MODEL_PATH):
             raise FileNotFoundError(f"Trained model not found at {TRAINED_MODEL_PATH}. Train first!")
-        logger.info(f"Applying LoRA Adapters from {TRAINED_MODEL_PATH}...")
+        logger.info(f"Applying LoRA Adapters from {os.path.abspath(TRAINED_MODEL_PATH)}...")
         model = PeftModel.from_pretrained(model, TRAINED_MODEL_PATH).to(DEVICE)
     
     model.eval()
@@ -251,6 +253,9 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         logger.info(f"Turn {step_n}: {current_agent} is Thinking...")
         
         raw_reply = generate_action(current_agent, agent_histories[current_agent], model, tokenizer)
+        if LOG_RAW_REPLIES and step_n <= LOG_RAW_REPLY_TURNS:
+            compact_reply = raw_reply.replace("\n", "\\n")
+            logger.info(f"RAW_REPLY[{task_id}][turn={step_n}][agent={current_agent}]: {compact_reply[:300]}")
         
         # Extract the first valid JSON object (handles multi-JSON output)
         action_dict = extract_first_json_object(raw_reply)

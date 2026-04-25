@@ -8,9 +8,9 @@ import random
 import re
 import torch
 from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import GRPOTrainer, GRPOConfig, SFTTrainer, SFTConfig
-from peft import LoraConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from trl import GRPOTrainer, GRPOConfig
+from peft import LoraConfig, get_peft_model
 
 # Import our environment and data models
 from server.app import CloudSREEnv, Action, ActionType
@@ -36,6 +36,9 @@ def extract_first_json_object(raw_text: str) -> tuple[dict | None, int]:
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
+RUN_GRPO_AFTER_SFT = False
+SFT_FINAL_MODEL_PATH = "./grpo_sre_model/final"
+GRPO_MODEL_PATH = "./grpo_sre_model/grpo_final"
 
 if torch.cuda.is_available():
     # A100 supports TF32/BF16 well; this speeds up matmul-heavy training.
@@ -1009,20 +1012,67 @@ def build_dataset(num_samples: int = 800):
     return Dataset.from_dict({"prompt": prompts_list})
 
 
-def build_sft_dataset(tokenizer, num_episodes: int = 80):
-    """Build supervised chat transcripts with exact expert JSON completions."""
-    texts = []
+def build_sft_dataset(tokenizer, num_episodes: int = 80, max_length: int = 1024):
+    """Build supervised examples where only assistant JSON tokens are labeled."""
+    records = []
     for role_key, user_msg, assistant_msg in generate_expert_examples(num_episodes):
-        messages = [
+        prompt_messages = [
             {"role": "system", "content": PROMPTS[role_key]},
             {"role": "user", "content": user_msg},
+        ]
+        full_messages = [
+            *prompt_messages,
             {"role": "assistant", "content": assistant_msg},
         ]
-        texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
 
-    random.shuffle(texts)
-    logger.info(f"Built SFT warm-start dataset with {len(texts)} expert examples")
-    return Dataset.from_dict({"text": texts})
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        full_text = tokenizer.apply_chat_template(full_messages, tokenize=False)
+
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+
+        if len(full_ids) > max_length:
+            overflow = len(full_ids) - max_length
+            full_ids = full_ids[overflow:]
+            prompt_len = max(0, len(prompt_ids) - overflow)
+        else:
+            prompt_len = len(prompt_ids)
+
+        labels = [-100] * len(full_ids)
+        labels[prompt_len:] = full_ids[prompt_len:]
+        records.append({
+            "input_ids": full_ids,
+            "attention_mask": [1] * len(full_ids),
+            "labels": labels,
+        })
+
+    random.shuffle(records)
+    logger.info(f"Built completion-only SFT dataset with {len(records)} expert examples")
+    return Dataset.from_list(records)
+
+
+def completion_only_collator(features, pad_token_id: int = 0):
+    """Pad variable-length supervised examples, keeping prompt labels masked."""
+    max_len = max(len(feature["input_ids"]) for feature in features)
+    input_ids = []
+    attention_mask = []
+    labels = []
+
+    for feature in features:
+        pad_len = max_len - len(feature["input_ids"])
+        input_ids.append(feature["input_ids"] + [pad_token_id] * pad_len)
+        attention_mask.append(feature["attention_mask"] + [0] * pad_len)
+        labels.append(feature["labels"] + [-100] * pad_len)
+
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+    }
 
 # ---------------------------------------------------------------------------
 # 3. The Main Training Loop
@@ -1048,11 +1098,12 @@ def main():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         task_type="CAUSAL_LM",
     )
+    model = get_peft_model(model, peft_config)
 
     # Phase 1: supervised warm-start on exact expert actions. This prevents
     # GRPO from wasting early steps discovering JSON format and handoff basics.
     sft_dataset = build_sft_dataset(tokenizer, num_episodes=100)
-    sft_args = SFTConfig(
+    sft_args = TrainingArguments(
         output_dir="./grpo_sre_model/sft_warmstart",
         learning_rate=1e-4,
         per_device_train_batch_size=8,
@@ -1062,21 +1113,27 @@ def main():
         report_to="none",
         bf16=torch.cuda.is_available(),
         fp16=False,
-        max_length=1024,
-        packing=False,
+        remove_unused_columns=False,
     )
 
-    sft_trainer = SFTTrainer(
+    sft_trainer = Trainer(
         model=model,
         args=sft_args,
         train_dataset=sft_dataset,
-        processing_class=tokenizer,
-        peft_config=peft_config,
+        data_collator=lambda features: completion_only_collator(features, tokenizer.pad_token_id),
     )
 
     logger.info("\n========== STARTING SFT WARM-START ==========")
     sft_trainer.train()
     model = sft_trainer.model
+    logger.info(f"\nSaving SFT-only adapter to {SFT_FINAL_MODEL_PATH} ...")
+    model.save_pretrained(SFT_FINAL_MODEL_PATH)
+    tokenizer.save_pretrained(SFT_FINAL_MODEL_PATH)
+
+    if not RUN_GRPO_AFTER_SFT:
+        logger.info("Skipping GRPO because RUN_GRPO_AFTER_SFT=False. Use the SFT-only adapter for raw inference.")
+        logger.info("Training complete. You can now use this model in inference.py!")
+        return
 
     # Phase 2: GRPO reward optimization on the same scenario distribution.
     dataset = build_dataset(num_samples=800)
@@ -1110,9 +1167,9 @@ def main():
     logger.info("\n========== STARTING GRPO RL TRAINING ==========")
     trainer.train()
     
-    logger.info("\nSaving trained model to ./grpo_sre_model/final ...")
-    trainer.save_model("./grpo_sre_model/final")
-    logger.info("Training complete. You can now use this model in inference.py!")
+    logger.info(f"\nSaving optional GRPO adapter to {GRPO_MODEL_PATH} ...")
+    trainer.save_model(GRPO_MODEL_PATH)
+    logger.info("Training complete. SFT-only remains at the default inference path.")
 
 if __name__ == "__main__":
     main()
