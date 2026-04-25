@@ -123,9 +123,11 @@ def save_episode_trace(trace: dict, success: bool) -> None:
     safe_task = re.sub(r"[^a-zA-Z0-9_.-]+", "_", trace["task_id"])
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     base_path = os.path.join(TRACE_OUTPUT_DIR, f"{timestamp}_{safe_task}")
+    latest_path = os.path.join(TRACE_OUTPUT_DIR, f"latest_{safe_task}")
 
-    with open(base_path + ".json", "w", encoding="utf-8") as f:
-        json.dump(trace, f, indent=2)
+    for json_path in (base_path + ".json", latest_path + ".json"):
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(trace, f, indent=2)
 
     lines = [
         f"# Episode Trace: {trace['task_id']}",
@@ -165,10 +167,14 @@ def save_episode_trace(trace: dict, success: bool) -> None:
             lines.append(f"- `{key}`: {value}")
         lines.append("")
 
-    with open(base_path + ".md", "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    markdown = "\n".join(lines)
+    for md_path in (base_path + ".md", latest_path + ".md"):
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(markdown)
 
-    logger.info(f"Episode trace saved to {base_path}.json and {base_path}.md")
+    logger.info(
+        f"Episode trace saved to {base_path}.json/.md and latest files at {latest_path}.json/.md"
+    )
 
 
 def load_eval_model(mode="TRAINED"):
