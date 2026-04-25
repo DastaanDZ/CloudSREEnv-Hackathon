@@ -15,6 +15,21 @@ from peft import LoraConfig
 from server.app import CloudSREEnv, Action, ActionType
 from prompts import PROMPTS, SCENARIO_MESSAGES
 
+
+def extract_first_json_object(raw_text: str) -> tuple[dict | None, int]:
+    """Extract the first valid JSON object from text. Returns (dict, start_pos) or (None, -1)."""
+    start = raw_text.find("{")
+    if start == -1:
+        return None, -1
+    try:
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(raw_text, start)
+        if isinstance(obj, dict):
+            return obj, start
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None, -1
+
 # --- Configuration ---
 # MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" 
 MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
@@ -78,17 +93,10 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # =====================================================================
         # STAGE 3: JSON structure detection (manual)
         # =====================================================================
-        if "{" not in raw_text or "}" not in raw_text:
+        action_dict, json_start_pos = extract_first_json_object(raw_text)
+        if action_dict is None:
             rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.5))
             continue
-        
-        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if not json_match:
-            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.4))
-            continue
-        
-        json_str = json_match.group(0)
-        json_start_pos = json_match.start()
         
         # Bonus for JSON appearing early (manual)
         if json_start_pos <= 5:
@@ -101,12 +109,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # =====================================================================
         # STAGE 4: JSON parsing and compactness (manual)
         # =====================================================================
-        try:
-            action_dict = json.loads(json_str)
-            manual_reward += 0.15
-        except json.JSONDecodeError:
-            rewards.append(max(-1.0, manual_reward * MANUAL_WEIGHT_EARLY - 0.3))
-            continue
+        json_str = json.dumps(action_dict, separators=(',', ':'))
+        manual_reward += 0.15
         
         # Reward compact JSON (manual)
         json_length = len(json_str)

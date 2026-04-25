@@ -11,6 +11,21 @@ from peft import PeftModel
 from server.app import Action, ActionType, CloudSREEnv
 from prompts import PROMPTS  # Shared prompts with train.py
 
+
+def extract_first_json_object(raw_text: str) -> dict | None:
+    """Extract the first valid JSON object from text."""
+    start = raw_text.find("{")
+    if start == -1:
+        return None
+    try:
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(raw_text, start)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger("Evaluator")
@@ -99,16 +114,8 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         raw_reply = generate_action(current_agent, agent_histories[current_agent], model, tokenizer)
         
         # Extract the first valid JSON object (handles multi-JSON output)
-        action_dict = None
-        try:
-            decoder = json.JSONDecoder()
-            start = raw_reply.find('{')
-            if start != -1:
-                action_dict, _ = decoder.raw_decode(raw_reply, start)
-        except (json.JSONDecodeError, ValueError):
-            pass
-        
-        if not action_dict or not isinstance(action_dict, dict):
+        action_dict = extract_first_json_object(raw_reply)
+        if action_dict is None:
             logger.warning(f"PARSE ERROR: No valid JSON | Content: {raw_reply[:80]}...")
             agent_histories[current_agent] += "\n[SYSTEM] Error: Output ONE valid JSON object. No prose, no multiple objects."
             continue
