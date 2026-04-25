@@ -460,7 +460,10 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
         
         # Turn 1: IC delegates to L1
         trajectories.append(("IC", agent_histories["IC"]))
-        agent_histories["L1_Triage"] = "New message from IC: Investigate the incident. Check cluster status."
+        if "task1" in task:
+            agent_histories["L1_Triage"] = "New message from IC: Investigate customer login failures in the authentication flow. Check auth-api if needed."
+        else:
+            agent_histories["L1_Triage"] = "New message from IC: Investigate the incident. Check cluster status."
         
         # Turn 2: L1 lists services
         trajectories.append(("L1_Triage", agent_histories["L1_Triage"]))
