@@ -25,11 +25,9 @@ CloudSREEnv is a multi-agent SRE incident-response environment for training and 
 
 | Artifact | Link |
 |---|---|
-| Hugging Face Space | **TBD: add HF Space URL** |
-| Colab Training Notebook | **TBD: add Colab URL** |
-| Mini-blog / Demo Video | **TBD: add HF blog or YouTube URL** |
-| Trained SFT Adapter | **TBD: add model/adapters URL if uploaded** |
-
+| Hugging Face Space | https://huggingface.co/spaces/dastaandz/FinalCloudSRE/tree/main |
+| Colab Training Notebook |  https://colab.research.google.com/drive/1_06Ts3qavU4n_5PucQJZpynbNOCFNNEz#scrollTo=aWu3AC3PGw5f |
+| Mini-blog / Demo Video | https://huggingface.co/spaces/dastaandz/FinalCloudSRE/blob/main/Blog.md |
 ---
 
 ## Why This Matters
@@ -290,7 +288,10 @@ assets/
 The plot generator produces:
 
 - `assets/sft_training_loss.png`
-- `assets/reward_progress.png`
+![alt text](training_loss.png)
+
+- `assets/benchmark_success_comparison.png`
+![alt text](assets/benchmark_success_comparison.svg)
 
 `sft_training_loss.png` shows supervised loss over training steps.  
 `reward_progress.png` shows a training-time SFT reward proxy from Unsloth logs, computed as `exp(-loss)`.
