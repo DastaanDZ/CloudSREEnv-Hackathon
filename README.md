@@ -26,7 +26,7 @@ CloudSREEnv is a multi-agent SRE incident-response environment for training and 
 | Artifact | Link |
 |---|---|
 | Hugging Face Space | https://huggingface.co/spaces/dastaandz/FinalCloudSRE/tree/main |
-| Colab Training Notebook |  https://colab.research.google.com/drive/1_06Ts3qavU4n_5PucQJZpynbNOCFNNEz#scrollTo=aWu3AC3PGw5f |
+| Colab Training Notebook |  https://colab.research.google.com/drive/1_06Ts3qavU4n_5PucQJZpynbNOCFNNEz?usp=sharing|
 | Mini-blog / Demo Video | https://huggingface.co/spaces/dastaandz/FinalCloudSRE/blob/main/Blog.md |
 ---
 
