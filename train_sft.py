@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 from datasets import Dataset
@@ -29,6 +30,14 @@ MAX_LENGTH = 1024
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("SFTTrainer")
+
+
+def log_dependency_versions() -> None:
+    for package in ("torch", "transformers", "accelerate", "datasets", "peft"):
+        try:
+            logger.info(f"{package}: {version(package)}")
+        except PackageNotFoundError:
+            logger.warning(f"{package}: not installed")
 
 
 def seed_everything(seed: int = SEED) -> None:
@@ -219,6 +228,7 @@ def tokenize_example(example: dict, tokenizer: AutoTokenizer) -> dict:
 
 def main() -> None:
     seed_everything()
+    log_dependency_versions()
     logger.info(f"Loading {MODEL_NAME} onto {DEVICE} for SFT...")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -265,7 +275,6 @@ def main() -> None:
         args=training_args,
         train_dataset=dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
-        tokenizer=tokenizer,
     )
 
     logger.info("\n========== STARTING SFT TRAINING ==========")
