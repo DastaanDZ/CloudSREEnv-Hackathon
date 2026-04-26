@@ -40,8 +40,8 @@ RUN_GRPO_AFTER_SFT = False
 SFT_FINAL_MODEL_PATH = "./grpo_sre_model/final"
 GRPO_MODEL_PATH = "./grpo_sre_model/grpo_final"
 SFT_MAX_LENGTH = 1024
-SFT_MICRO_BATCH_SIZE = 2
-SFT_GRADIENT_ACCUMULATION_STEPS = 4
+SFT_MICRO_BATCH_SIZE = 8
+SFT_GRADIENT_ACCUMULATION_STEPS = 1
 
 if torch.cuda.is_available():
     # A100 supports TF32/BF16 well; this speeds up matmul-heavy training.
@@ -1338,7 +1338,6 @@ def main():
     # Phase 1: supervised warm-start on exact expert actions. This prevents
     # GRPO from wasting early steps discovering JSON format and handoff basics.
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
 
     sft_dataset = build_sft_dataset(tokenizer, num_episodes=100, max_length=SFT_MAX_LENGTH)
     sft_args = TrainingArguments(
@@ -1351,8 +1350,7 @@ def main():
         report_to="none",
         bf16=torch.cuda.is_available(),
         fp16=False,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=False,
         remove_unused_columns=False,
     )
 
