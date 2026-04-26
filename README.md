@@ -15,24 +15,24 @@ tags:
 
 # CloudSREEnv 🛠️
 
-> **OpenEnv × Meta Developers Hackathon Submission**  
-> A multi-agent SRE incident-response environment where LLM agents learn to diagnose real production-style failures, avoid symptom-fixing traps, coordinate across roles, and execute the correct remediation through structured tools.
+**OpenEnv × Meta Developers Hackathon Submission**
+
+CloudSREEnv is a multi-agent SRE incident-response environment for training and evaluating LLM agents on realistic production failures. The agent must diagnose partial-observability incidents, avoid symptom-fixing traps, coordinate across roles, and execute the correct remediation through structured tools.
 
 ---
 
-## Submission Links
+## Submission Artifacts
 
 | Artifact | Link |
 |---|---|
 | Hugging Face Space | **TBD: add HF Space URL** |
 | Colab Training Notebook | **TBD: add Colab URL** |
 | Mini-blog / Demo Video | **TBD: add HF blog or YouTube URL** |
-| Slides | **TBD: optional slide deck URL** |
 | Trained SFT Adapter | **TBD: add model/adapters URL if uploaded** |
 
 ---
 
-## Why This Environment Matters
+## Why This Matters
 
 Modern LLM agents can often produce plausible incident-response text, but they struggle with the hard part of SRE work: maintaining state across tools, separating symptoms from root causes, coordinating handoffs, and knowing when an incident is actually safe to close.
 
@@ -44,8 +44,8 @@ Incident Commander -> L1 Triage -> evidence gathering -> root cause report -> L2
 
 This directly targets two OpenEnv Hackathon themes:
 
-- **Theme #1: Multi-Agent Interactions** — IC, L1, and L2 agents must coordinate through explicit messages and role boundaries.
-- **Theme #3: World Modeling / Professional Tasks** — the environment simulates dynamic infrastructure state, tool feedback, causal failures, and delayed success criteria.
+- **Theme #1: Multi-Agent Interactions**: IC, L1, and L2 agents coordinate through explicit messages and role boundaries.
+- **Theme #3: World Modeling / Professional Tasks**: the environment simulates dynamic infrastructure state, tool feedback, causal failures, and delayed success criteria.
 
 ---
 
@@ -63,7 +63,7 @@ The environment is designed to teach an LLM to:
 The current training approach is **SFT-first**:
 
 ```text
-Base Model -> Supervised Fine-Tuning -> Strict Evaluation -> Optional GRPO Refinement
+Base model -> SFT on expert trajectories -> strict evaluation -> optional GRPO refinement
 ```
 
 GRPO is intentionally not the main claim right now. SFT teaches the workflow reliably; GRPO can later refine robustness, efficiency, and reward optimization.
@@ -78,12 +78,11 @@ CloudSREEnv/
 │   ├── app.py             # OpenEnv environment, simulator, rewards, terminal graders
 │   └── __init__.py
 ├── prompts.py             # Shared IC / L1 / L2 prompts
-├── train.py               # SFT-first entry point; GRPO disabled for now
-├── train_sft.py           # LoRA SFT trainer with expert action trajectories
+├── train.py               # SFT-first entry point
+├── train_sft.py           # Transformers/PEFT SFT trainer
 ├── train_unsloth.py       # Colab-friendly Unsloth 4-bit LoRA SFT trainer
-├── inference.py           # BASE / SFT / TRAINED strict evaluator + episode traces
-├── scripts/               # Benchmark and README plot helpers
-├── assets/                # README plot images
+├── inference.py           # BASE / SFT / TRAINED evaluator
+├── scripts/               # Benchmark and plot helpers
 ├── openenv.yaml           # OpenEnv task metadata
 ├── Dockerfile             # Hugging Face Space container
 └── README.md
@@ -97,7 +96,8 @@ CloudSREEnv/
 
 - `reset(task_id)` to start an incident,
 - `step(action)` to execute structured actions,
-- observations from logs/status tables,
+- `state()` / `GET /state` for dashboard/debug visibility,
+- observations from logs and service tables,
 - dense rewards from composable rubrics,
 - deterministic terminal grading for task success.
 
@@ -122,6 +122,16 @@ CloudSREEnv/
 | `REPAIR_REPLICA(service_id)` | Repair a stale cache replica after split-brain |
 | `CLOSE_INCIDENT` | Close only when success criteria are satisfied |
 
+### API Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /reset` | Start a task/scenario |
+| `POST /step` | Execute one structured action and return observation, reward, done, info |
+| `GET /state` | Return full simulator state for dashboards/debugging |
+
+`/state` is intended for visualization and debugging, not as an agent tool. The agent should solve incidents through observations returned by `step`.
+
 ---
 
 ## Scenarios And Tasks
@@ -134,7 +144,7 @@ CloudSREEnv/
 | `task4_noisy_neighbor` | Hard | `payment-db` is slow because `notification-worker` consumes ~8000MB | Agent must avoid fixing victim `payment-db`; L2 caps `notification-worker` memory to `<=2048MB` |
 | `task5_cache_split_brain` | Hard | `checkout-api` sees cart/session mismatch due to stale cache replica | L1 checks checkout and both cache nodes, compares epochs, L2 repairs `session-cache-replica` |
 
-### Why Task 4 and 5 Are Important
+### Why Task 4 And 5 Matter
 
 These tasks are designed as **victim-vs-root-cause traps**:
 
@@ -162,44 +172,32 @@ This makes the environment suitable for both supervised training and future RL r
 
 ## Training Pipeline
 
-### Current Recommended Path
+### Recommended Flow
 
 ```text
-Qwen2.5-3B-Instruct
-        |
-        v
-SFT on expert SRE trajectories
-        |
-        v
-Strict evaluation without controller guardrails
-        |
-        v
-Optional GRPO refinement later
+Qwen/Qwen2.5-3B-Instruct
+    -> LoRA SFT on expert SRE trajectories
+    -> strict evaluation without controller guardrails
+    -> optional GRPO reward refinement later
 ```
 
 SFT is used first because the model must learn the workflow structure before RL rewards can reliably refine it.
 
-### Run SFT Training
+### Standard SFT Training
 
 ```bash
 python train.py
 ```
 
-`train.py` currently launches `train_sft.py`. GRPO code is disabled for now to keep the comparison clean.
+This launches the plain Transformers/PEFT SFT path (`train_sft.py`).
 
 ### Colab Low-Memory Training With Unsloth
 
-The hackathon requires a minimal training script using Unsloth or HF TRL. For Colab GPUs, use the Unsloth path:
+For Colab GPUs, use the Unsloth 4-bit LoRA path:
 
 ```bash
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 pip install --no-deps trl peft accelerate bitsandbytes
-python train_unsloth.py
-```
-
-Alternatively, use the common training entry point:
-
-```bash
 USE_UNSLOTH=1 python train.py
 ```
 
@@ -209,22 +207,18 @@ USE_UNSLOTH=1 python train.py
 ./sft_sre_model/final
 ```
 
-Use `train_sft.py` as the plain Transformers/PEFT fallback if Unsloth is unavailable.
-
-### Run Strict Evaluation
+### Strict Evaluation
 
 ```bash
 python inference.py
 ```
 
-The evaluator supports:
+`inference.py` supports:
 
 ```bash
-# Option 1: edit EVAL_MODE in inference.py, then run:
-python inference.py
-
-# Option 2: run the benchmark helper for BASE/SFT and held-out comparisons:
-python scripts/evaluate_benchmarks.py
+EVAL_MODE = "BASE"     # raw base model
+EVAL_MODE = "SFT"      # SFT adapter from ./sft_sre_model/final
+EVAL_MODE = "TRAINED"  # optional GRPO adapter from ./grpo_sre_model/final
 ```
 
 Strict mode is enabled by default:
@@ -234,6 +228,41 @@ STRICT_EVAL = True
 ```
 
 That means inference does not force IC/L1/L2 transitions. The model must produce the actions itself.
+
+To enable optional non-strict helper guardrails for debugging, set `STRICT_EVAL = False` in `inference.py`.
+
+### Benchmark And Plot Artifacts
+
+Run the full BASE/SFT benchmark:
+
+```bash
+python scripts/evaluate_benchmarks.py
+```
+
+This writes:
+
+```text
+episode_traces/benchmark_results.json
+```
+
+Generate README plot assets:
+
+```bash
+python scripts/generate_readme_assets.py
+```
+
+This reads:
+
+```text
+episode_traces/benchmark_results.json
+episode_traces/unsloth_training_metrics.json
+```
+
+and writes plot images under:
+
+```text
+assets/
+```
 
 ---
 
@@ -254,25 +283,21 @@ Fill this table after rerunning `BASE` and retrained `SFT` on the current 5-task
 
 Previously, the SFT model passed the original 3-task strict evaluation. The current 5-task benchmark should be rerun after retraining with the updated SFT data.
 
-### Plots
+### Expected Plot Assets
 
-The following plot assets are generated under `assets/`. Re-run the generator after updating `episode_traces/benchmark_results.json`:
+The plot generator produces:
 
-```bash
-python scripts/generate_readme_assets.py
-```
+- `assets/sft_training_loss.png`
+- `assets/reward_progress.png`
 
-![SFT Training Loss](assets/sft_training_loss.png)
+`sft_training_loss.png` shows supervised loss over training steps.  
+`reward_progress.png` shows a training-time SFT reward proxy from Unsloth logs, computed as `exp(-loss)`.
 
-Caption: SFT loss over training steps. Lower loss indicates the model learned to emit structured expert actions.
-
-![Reward Progress](assets/reward_progress.png)
-
-Caption: Training-time SFT reward proxy from Unsloth logs. It is computed as `exp(-loss)`, so it rises toward `1.0` as the model learns to emit expert actions. This is separate from the OpenEnv terminal reward used during strict evaluation.
+The reward proxy is separate from the OpenEnv terminal reward used during strict evaluation.
 
 ---
 
-## Episode Trace Dashboard
+## Outputs And Dashboard Support
 
 Normal inference does **not** write per-episode trace files by default. This prevents `episode_traces/` from filling up with timestamped files after every run.
 
@@ -310,11 +335,17 @@ Optional traces show:
 - reward breakdown,
 - success/failure state.
 
+For live dashboards, use:
+
+```bash
+GET /state
+```
+
+This returns the current task, service table, action history, incident state, and scenario profile.
+
 ---
 
 ## Quick Start
-
-### Local Setup
 
 ```bash
 pip install -r requirements.txt
@@ -322,7 +353,15 @@ python train.py
 python inference.py
 ```
 
-### Docker / Hugging Face Space
+For Unsloth training in Colab:
+
+```bash
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install --no-deps trl peft accelerate bitsandbytes
+USE_UNSLOTH=1 python train.py
+```
+
+For Docker / Hugging Face Space:
 
 ```bash
 docker build -t cloudsreenv .
@@ -337,7 +376,7 @@ docker run -p 8000:8000 cloudsreenv
 |---|---|---|
 | Environment Innovation (40%) | Multi-agent SRE simulator with victim-vs-root-cause traps, dynamic state, and deterministic graders | Strong |
 | Storytelling (30%) | README explains problem, environment, agent workflow, and demo path | Needs final artifact links |
-| Showing Improvement (20%) | BASE vs SFT strict eval, episode traces, and generated README plots | Needs current 5-task rerun |
+| Showing Improvement (20%) | BASE vs SFT strict eval, benchmark JSON, and generated README plots | Needs current 5-task rerun |
 | Reward + Pipeline (10%) | Coherent composable reward design plus SFT-first training pipeline | Strong |
 
 ---
@@ -351,7 +390,7 @@ docker run -p 8000:8000 cloudsreenv
 - [ ] Run strict `BASE` benchmark across all 5 tasks.
 - [ ] Run strict `SFT` benchmark across all 5 tasks.
 - [ ] Run held-out strict benchmark.
-- [x] Generate initial plot images under `assets/`.
+- [ ] Generate final plot images under `assets/`.
 - [x] Confirm `openenv.yaml` lists all 5 tasks.
 - [ ] Confirm Hugging Face Space starts successfully.
 
@@ -362,12 +401,11 @@ docker run -p 8000:8000 cloudsreenv
 - `TBD: add HF Space URL`
 - `TBD: add Colab URL`
 - `TBD: add HF blog or YouTube URL`
-- `TBD: optional slide deck URL`
 - `TBD: trained adapter URL if uploaded`
 - BASE strict 5-task results
 - SFT strict 5-task results after retraining
 - Held-out strict results
-- Updated final plot images in `assets/` after rerunning the 5-task benchmark
+- Final plot images in `assets/` after rerunning the 5-task benchmark
 
 ---
 
