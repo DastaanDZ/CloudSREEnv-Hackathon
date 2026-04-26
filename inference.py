@@ -34,12 +34,13 @@ logger = logging.getLogger("Evaluator")
 # ---------------------------------------------------------------------------
 # 1. EVALUATION CONFIGURATION
 # ---------------------------------------------------------------------------
-# TOGGLE THIS: Use "BASE" to generate 'Before' logs, "TRAINED" for 'After' logs.
-EVAL_MODE = "TRAINED" 
+# TOGGLE THIS: Use "BASE", "SFT", or "TRAINED" (GRPO adapter).
+EVAL_MODE = "SFT"
 # Set True for fair BASE vs TRAINED comparison without controller-style guardrails.
 STRICT_EVAL = True
 
 TRAINED_MODEL_PATH = "./grpo_sre_model/final"
+SFT_MODEL_PATH = "./sft_sre_model/final"
 # BASE_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -197,11 +198,17 @@ def load_eval_model(mode="TRAINED"):
         torch_dtype=torch.float16
     ).to(DEVICE)
 
+    adapter_path = None
     if mode == "TRAINED":
-        if not os.path.exists(TRAINED_MODEL_PATH):
-            raise FileNotFoundError(f"Trained model not found at {TRAINED_MODEL_PATH}. Train first!")
-        logger.info(f"Applying LoRA Adapters from {TRAINED_MODEL_PATH}...")
-        model = PeftModel.from_pretrained(model, TRAINED_MODEL_PATH).to(DEVICE)
+        adapter_path = TRAINED_MODEL_PATH
+    elif mode == "SFT":
+        adapter_path = SFT_MODEL_PATH
+
+    if adapter_path:
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(f"Adapter not found at {adapter_path}. Train first!")
+        logger.info(f"Applying LoRA Adapters from {adapter_path}...")
+        model = PeftModel.from_pretrained(model, adapter_path).to(DEVICE)
     
     model.eval()
     return model, tokenizer

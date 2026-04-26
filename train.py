@@ -1,5 +1,8 @@
 """
-train.py — Hugging Face TRL GRPO Training Loop for CloudSREEnv (Colab T4 Optimized)
+train.py - SFT-first training entry point for CloudSREEnv.
+
+The old GRPO loop is kept below but disabled for now. Use train_sft.py directly
+or run this file to launch the SFT warm-start training path.
 """
 
 import json
@@ -9,7 +12,8 @@ import re
 import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import GRPOTrainer, GRPOConfig
+# GRPO is disabled for now. Re-enable this import only when returning to RL.
+# from trl import GRPOTrainer, GRPOConfig
 from peft import LoraConfig
 
 # Import our environment and data models
@@ -38,7 +42,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger("GRPOTrainer")
+logger = logging.getLogger("Trainer")
 
 def seed_everything(seed: int = SEED) -> None:
     random.seed(seed)
@@ -856,7 +860,9 @@ def build_dataset(num_samples: int = 800):
 # ---------------------------------------------------------------------------
 # 3. The Main Training Loop
 # ---------------------------------------------------------------------------
-def main():
+def grpo_main_disabled():
+    raise RuntimeError("GRPO training is disabled for now. Use train_sft.py / SFT first.")
+
     seed_everything()
     logger.info(f"Loading {MODEL_NAME} onto {DEVICE}...")
     
@@ -912,6 +918,13 @@ def main():
     logger.info("\nSaving trained model to ./grpo_sre_model/final ...")
     trainer.save_model("./grpo_sre_model/final")
     logger.info("Training complete. You can now use this model in inference.py!")
+
+
+def main():
+    logger.info("GRPO is disabled for now. Launching SFT training instead...")
+    from train_sft import main as sft_main
+
+    sft_main()
 
 if __name__ == "__main__":
     main()
