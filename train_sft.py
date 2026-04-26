@@ -381,8 +381,9 @@ def main() -> None:
 
     training_args = TrainingArguments(
         output_dir="./sft_sre_model",
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=1,
+        # Fits smaller Colab/T4-style GPUs while preserving effective batch size.
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
         learning_rate=2e-4,
         num_train_epochs=3,
         logging_steps=10,
