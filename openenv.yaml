@@ -1,8 +1,10 @@
 name: CloudSREEnv
-version: "1.2.0"
+version: "2.0.0"
 description: >
-  A high-fidelity SRE simulator featuring cascading failure dependencies 
-  where database issues trigger upstream API performance bottlenecks.
+  A multi-agent SRE incident-response simulator for OpenEnv. Agents coordinate
+  across Incident Commander, L1 Triage, and L2 SME roles to diagnose partially
+  observable incidents, avoid symptom-fixing traps, and apply the correct
+  remediation.
 author: OraTeam
 license: MIT
 
@@ -39,22 +41,48 @@ tasks:
     name: "Cascading Latency Resolution"
     difficulty: hard
     description: >
-      Complex Root Cause Analysis: Detect and fix a bottleneck where 
-      payment-db slowness causes auth-api timeouts. Scaling the 
-      API won't work; the database must be scaled first.
+      Diagnose auth-api latency caused by CPU saturation under high RPS.
+      The agent must collect evidence and scale auth-api correctly.
     success_criteria: >
-      Final score 0.99: Both payment-db and auth-api return to 
-      baseline latency thresholds.
+      Final score 1.00: auth-api is scaled to cpu >= 2048 and latency recovers.
     max_steps: 20
     scenario: performance_bottleneck
 
+  - id: task4_noisy_neighbor
+    name: "Resource Contention / Noisy Neighbor"
+    difficulty: hard
+    description: >
+      payment-db is slow, but the root cause is notification-worker consuming
+      excessive memory and creating node pressure. payment-db is the victim.
+    success_criteria: >
+      Final score 1.00: L1 identifies notification-worker as the noisy neighbor,
+      L2 applies UPDATE_CONFIG with memory_limit_mb <= 2048, and payment-db latency recovers.
+    max_steps: 20
+    scenario: noisy_neighbor
+
+  - id: task5_cache_split_brain
+    name: "Split-Brain Cache Consistency"
+    difficulty: hard
+    description: >
+      checkout-api reports cart/session mismatches, but the root cause is a
+      stale session-cache-replica with a divergent cache epoch.
+    success_criteria: >
+      Final score 1.00: L1 checks checkout-api plus both cache nodes, identifies
+      epoch divergence, and L2 runs REPAIR_REPLICA on session-cache-replica.
+    max_steps: 20
+    scenario: cache_split_brain
+
 reward_shaping:
-  useful_diagnostic: +0.1
-  hallucinated_service: -0.2
-  unnecessary_restart: -0.5
-  step_penalty: -0.02         # Encourages resolution speed
-  cost_penalty: -0.1          # Discourages over-provisioning (>4000m CPU)
-  task_completion_bonus: +0.9 # Final non-binary success signal
+  tool_discovery: +0.05
+  collaboration: +0.10
+  authorized_action: +0.20
+  principle_new_observation: +0.12_to_0.18
+  principle_confidence_gain: +0.22
+  principle_correct_remediation: +0.35
+  duplicate_block: -0.40
+  false_closure_penalty: -0.50
+  step_penalty: -0.02_per_step
+  task_completion_bonus: +0.80_to_1.00
 
 constraints:
   memory_limit_gb: 8
