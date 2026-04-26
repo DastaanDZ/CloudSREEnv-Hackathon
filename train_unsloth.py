@@ -29,7 +29,7 @@ from train_sft import MAX_LENGTH, MODEL_NAME, OUTPUT_DIR, SEED, build_expert_exa
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("UnslothSFT")
-METRICS_OUTPUT_PATH = Path("./training_metrics/unsloth_training_metrics.json")
+METRICS_OUTPUT_PATH = Path("./episode_traces/unsloth_training_metrics.json")
 
 
 def log_dependency_versions() -> None:

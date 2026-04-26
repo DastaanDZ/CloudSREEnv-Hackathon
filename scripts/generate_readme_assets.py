@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = ROOT / "assets"
 BENCHMARK_PATH = ROOT / "episode_traces" / "benchmark_results.json"
-UNSLOTH_METRICS_PATH = ROOT / "training_metrics" / "unsloth_training_metrics.json"
+UNSLOTH_METRICS_PATH = ROOT / "episode_traces" / "unsloth_training_metrics.json"
 
 
 SFT_LOSS_POINTS = [
