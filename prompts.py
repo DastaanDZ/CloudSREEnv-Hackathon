@@ -43,7 +43,8 @@ Workflow:
 1. Run LIST_SERVICES to see cluster state.
 2. Run GET_LOGS on any service showing Error, high latency, or warnings.
    If users report login/authentication failures, inspect auth-api logs even if status shows Running.
-   If payment-db is slow but another service has extreme memory usage, report that noisy neighbor as root cause.
+   If payment-db is slow but notification-worker has extreme memory usage, payment-db is only the symptom.
+   Check notification-worker logs before reporting; the root cause and only remediation target is notification-worker.
    If checkout has intermittent cart/session mismatches, compare session-cache-primary and session-cache-replica logs for divergent cache epochs.
 3. Report root cause and affected service to IC."""
 
@@ -66,7 +67,8 @@ Available Actions:
 Workflow:
 1. If service is in Error/CrashLoop: use RESTART.
 2. If service has high CPU/latency: use SCALE with cpu_value >= 2048.
-3. If a low-priority worker is hogging node memory: use UPDATE_CONFIG on that worker with memory_limit_mb <= 2048.
+3. If notification-worker is hogging node memory: use UPDATE_CONFIG on notification-worker with memory_limit_mb exactly 2048.
+   Never invent payment-worker. Never UPDATE_CONFIG, RESTART, or SCALE payment-db for task4 noisy-neighbor memory pressure.
 4. If a cache replica has divergent cache_epoch after split-brain: use REPAIR_REPLICA on the replica.
 5. After applying fix, message IC to confirm completion."""
 
@@ -104,6 +106,8 @@ SCENARIO_MESSAGES = {
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\nNew message from L1_Triage: Root cause found. notification-worker is using 8000MB RAM and starving payment-db.",
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\nNew message from L1_Triage: payment-db is throttled by node memory pressure from notification-worker. Apply a strict memory limit to notification-worker.",
         "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency.\nNew message from L1_Triage: notification-worker is the noisy neighbor at 8000MB RAM.\nNew message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\nNew message from L1_Triage: payment-db is only the symptom. notification-worker is causing node memory pressure and needs UPDATE_CONFIG memory_limit_mb 2048.",
+        "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency.\nNew message from L1_Triage: notification-worker is starving payment-db.\nNew message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
 
         # Task5: cache split-brain (needs REPAIR_REPLICA)
         "INITIAL ALERT:\n[SYSTEM ALERT] Intermittent checkout cart mismatches and session failures detected.",
@@ -138,6 +142,8 @@ SCENARIO_MESSAGES = {
 
         # Task4: Noisy neighbor memory contention
         "New message from IC: Checkout latency on payment-db. Investigate all services.\nObs: auth-api              Running    CPU=1024m MEM=2048MB LAT=370ms\npayment-db            Running    CPU=2048m MEM=4096MB LAT=650ms\ninventory-svc         Running    CPU=1024m MEM=2048MB LAT=370ms\nnotification-worker   Running    CPU=1024m MEM=8000MB LAT=180ms",
+        "New message from IC: Checkout latency on payment-db. payment-db may be only the symptom.\nObs: auth-api              Running    CPU=1024m MEM=2048MB LAT=370ms\npayment-db            Running    CPU=2048m MEM=4096MB LAT=650ms\ninventory-svc         Running    CPU=1024m MEM=2048MB LAT=370ms\nnotification-worker   Running    CPU=1024m MEM=8000MB LAT=180ms",
+        "New message from IC: Checkout latency on payment-db.\nObs: === Logs: payment-db ===\n[WARN] query latency elevated due to node memory pressure\n[SYSTEM] payment-db is the symptom. Check notification-worker logs before reporting.",
         "New message from IC: payment-db is slow but CPU looks normal.\nObs: === Logs: notification-worker ===\n[WARN] Heap growth detected: notification batch cache at 8000MB\n[WARN] Node memory pressure: worker has no memory limit",
 
         # Task5: Split-brain cache evidence
@@ -171,6 +177,10 @@ SCENARIO_MESSAGES = {
         "New message from IC: Apply UPDATE_CONFIG to notification-worker with memory_limit_mb 2048.",
         "New message from IC: Noisy neighbor worker is causing DB latency.\nObs: notification-worker MEM=8000MB, payment-db LAT=650ms.",
         "New message from IC: Set notification-worker memory limit to 2048MB.\nObs: [OK] notification-worker memory limit set to 2048MB.",
+        "New message from IC: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker. Fix this issue.",
+        "New message from IC: Set payment-db memory limit to 1024 to resolve latency. Correct the target: use UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
+        "New message from IC: Repair payment-worker to recover from memory stress. Correct the target: use UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
+        "New message from IC: Fix checkout latency caused by notification-worker memory pressure.\nObs: [OK] notification-worker memory limit set to 2048MB.",
 
         # Task5: cache replica repair
         "New message from IC: session-cache-replica has divergent cache_epoch 1837 while primary is 1842. Repair the replica.",

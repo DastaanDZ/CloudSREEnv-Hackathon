@@ -282,11 +282,17 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 ["found:", "identified", "reports:", "root cause", "report findings"])
             is_login_context = any(kw in prompt_lower for kw in ["login failure", "authentication failure", "authentication flow"])
             is_resource_contention_context = (
-                "notification-worker" in prompt_lower
-                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "payment-db"])
+                any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "node memory pressure", "memory pressure"])
+                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "payment-db", "checkout latency"])
             )
             is_checkout_latency_context = "checkout latency" in prompt_lower or (
                 "payment-db" in prompt_lower and "latency" in prompt_lower
+            )
+            has_notification_worker_evidence = (
+                "=== logs: notification-worker ===" in prompt_lower
+                or "notification-worker   running" in prompt_lower
+                or "notification-worker is using 8000mb" in prompt_lower
+                or "notification-worker mem=8000mb" in prompt_lower
             )
             is_split_brain_context = any(kw in prompt_lower for kw in [
                 "cart total mismatch", "cart_total_mismatch", "session-cache", "cache_epoch", "split-brain"
@@ -310,7 +316,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     
             elif action_type == "GET_LOGS":
                 service_id = action_dict.get("service_id", "")
-                if has_log_content or has_reported:
+                if (
+                    is_resource_contention_context
+                    and service_id == "notification-worker"
+                    and not has_notification_worker_evidence
+                ):
+                    manual_reward += 0.80
+                elif has_log_content or has_reported:
                     manual_reward -= 0.40
                 elif is_checkout_latency_context and not has_service_list and service_id == "payment-db":
                     manual_reward -= 0.55
@@ -337,6 +349,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 target = action_dict.get("target", "")
                 if is_checkout_latency_context and not is_resource_contention_context:
                     manual_reward -= 0.65
+                elif is_resource_contention_context and target == "IC" and not has_notification_worker_evidence:
+                    manual_reward -= 0.55
                 elif is_split_brain_context and "session-cache-primary" not in prompt_lower and "session-cache-replica" not in prompt_lower:
                     manual_reward -= 0.55
                 elif has_log_content and target == "IC":
@@ -362,8 +376,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             fix_already_applied = any(kw in prompt_lower for kw in 
                 ["restarted", "scaled", "fix applied", "recovered", "back online", "memory limit set"])
             is_resource_contention_context = (
-                "notification-worker" in prompt_lower
-                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db"])
+                any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "node memory pressure", "memory pressure", "checkout latency"])
+                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db", "throttling"])
             )
             is_split_brain_context = (
                 "session-cache-replica" in prompt_lower
@@ -375,6 +389,8 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if fix_already_applied:
                     manual_reward -= 0.25
                 elif service_id in VALID_SERVICES:
+                    if is_resource_contention_context and service_id == "payment-db":
+                        manual_reward -= 0.80
                     if is_split_brain_context and service_id == "checkout-api":
                         manual_reward -= 0.65
                     manual_reward += 0.45
@@ -417,15 +433,21 @@ def sre_rubric_reward(prompts, completions, **kwargs):
 
                 if fix_already_applied:
                     manual_reward -= 0.25
+                elif is_resource_contention_context and service_id in {"payment-db", "payment-worker"}:
+                    manual_reward -= 1.00
                 elif is_resource_contention_context and service_id != "notification-worker":
                     manual_reward -= 0.80
                 elif service_id == "notification-worker" and isinstance(memory_limit_mb, int):
-                    if memory_limit_mb <= 2048:
-                        manual_reward += 0.75
+                    if memory_limit_mb == 2048:
+                        manual_reward += 0.95
+                    elif memory_limit_mb < 2048:
+                        manual_reward += 0.45
                     elif memory_limit_mb <= 4096:
-                        manual_reward += 0.25
+                        manual_reward += 0.10
+                    elif memory_limit_mb <= 6144:
+                        manual_reward -= 0.35
                     else:
-                        manual_reward -= 0.20
+                        manual_reward -= 0.60
                     if is_resource_contention_context:
                         manual_reward += 0.35
                 elif service_id in VALID_SERVICES:
@@ -768,7 +790,60 @@ def generate_synthetic_trajectories(num_episodes: int = 50):
             
             # Turn 8: IC closes incident
             trajectories.append(("IC", agent_histories["IC"]))
-    
+
+    # Extra hard task4 states from raw failures. These prompts are included in
+    # GRPO sampling so the reward function repeatedly trains exact target grounding.
+    hard_task4_trajectories = [
+        (
+            "L1_Triage",
+            "New message from IC: Checkout latency on payment-db.\n"
+            "Obs: === Logs: payment-db ===\n"
+            "[WARN] query latency elevated due to node memory pressure\n"
+            "[SYSTEM] payment-db is the symptom. Check notification-worker logs before reporting.",
+        ),
+        (
+            "L1_Triage",
+            "New message from IC: Checkout latency on payment-db.\n"
+            "Obs: === Logs: payment-db ===\n"
+            "[WARN] query latency elevated due to node memory pressure\n"
+            "Obs: === Logs: notification-worker ===\n"
+            "[WARN] Heap growth detected: notification batch cache at 8000MB\n"
+            "[WARN] Node memory pressure: worker has no memory limit",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\n"
+            "New message from L1_Triage: Root cause: payment-db is memory-stressed by notification-worker. "
+            "It needs UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\n"
+            "New message from L1_Triage: payment-db is only the symptom. notification-worker is causing node memory pressure.\n"
+            "New message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Repair payment-worker to recover from memory stress. "
+            "Correct the target: use UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker. Fix this issue.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Set payment-db memory limit to 1024 to resolve latency. "
+            "Correct the target: use UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Fix checkout latency caused by notification-worker memory pressure.\n"
+            "Obs: [OK] notification-worker memory limit set to 2048MB.",
+        ),
+    ]
+    trajectories = hard_task4_trajectories + trajectories
+
     return trajectories
 
 
