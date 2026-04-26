@@ -26,7 +26,7 @@ OUTPUT_DIR = "./sft_sre_model/final"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 SEED = 42
-MAX_LENGTH = 1024
+MAX_LENGTH = 768
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("SFTTrainer")
@@ -362,6 +362,8 @@ def main() -> None:
         torch_dtype=MODEL_DTYPE,
     ).to(DEVICE)
     model.config.use_cache = False
+    if torch.cuda.is_available():
+        model.gradient_checkpointing_enable()
 
     peft_config = LoraConfig(
         r=16,
@@ -382,8 +384,8 @@ def main() -> None:
     training_args = TrainingArguments(
         output_dir="./sft_sre_model",
         # Fits smaller Colab/T4-style GPUs while preserving effective batch size.
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
         learning_rate=2e-4,
         num_train_epochs=3,
         logging_steps=10,
