@@ -1,12 +1,14 @@
 """
 train.py - SFT-first training entry point for CloudSREEnv.
 
-The old GRPO loop is kept below but disabled for now. Use train_sft.py directly
-or run this file to launch the SFT warm-start training path.
+The old GRPO loop is kept below but disabled for now. By default this launches
+the plain Transformers/PEFT SFT path. Set USE_UNSLOTH=1 for the Colab-friendly
+Unsloth 4-bit LoRA path.
 """
 
 import json
 import logging
+import os
 import random
 import re
 import torch
@@ -921,8 +923,12 @@ def grpo_main_disabled():
 
 
 def main():
-    logger.info("GRPO is disabled for now. Launching SFT training instead...")
-    from train_sft import main as sft_main
+    if os.getenv("USE_UNSLOTH", "0").lower() in {"1", "true", "yes", "y"}:
+        logger.info("GRPO is disabled for now. Launching Unsloth SFT training...")
+        from train_unsloth import main as sft_main
+    else:
+        logger.info("GRPO is disabled for now. Launching standard SFT training...")
+        from train_sft import main as sft_main
 
     sft_main()
 

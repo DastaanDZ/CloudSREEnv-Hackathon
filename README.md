@@ -80,6 +80,7 @@ CloudSREEnv/
 ├── prompts.py             # Shared IC / L1 / L2 prompts
 ├── train.py               # SFT-first entry point; GRPO disabled for now
 ├── train_sft.py           # LoRA SFT trainer with expert action trajectories
+├── train_unsloth.py       # Colab-friendly Unsloth 4-bit LoRA SFT trainer
 ├── inference.py           # BASE / SFT / TRAINED strict evaluator + episode traces
 ├── scripts/               # Benchmark and README plot helpers
 ├── assets/                # README plot images
@@ -185,6 +186,30 @@ python train.py
 ```
 
 `train.py` currently launches `train_sft.py`. GRPO code is disabled for now to keep the comparison clean.
+
+### Colab Low-Memory Training With Unsloth
+
+The hackathon requires a minimal training script using Unsloth or HF TRL. For Colab GPUs, use the Unsloth path:
+
+```bash
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install --no-deps trl peft accelerate bitsandbytes
+python train_unsloth.py
+```
+
+Alternatively, use the common training entry point:
+
+```bash
+USE_UNSLOTH=1 python train.py
+```
+
+`train_unsloth.py` trains the same expert SRE action dataset as `train_sft.py`, but loads Qwen through Unsloth's 4-bit LoRA path to reduce VRAM use. It saves the adapter to the same location:
+
+```text
+./sft_sre_model/final
+```
+
+Use `train_sft.py` as the plain Transformers/PEFT fallback if Unsloth is unavailable.
 
 ### Run Strict Evaluation
 
