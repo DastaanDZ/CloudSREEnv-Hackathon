@@ -373,7 +373,7 @@ def main() -> None:
     )
     model = get_peft_model(model, peft_config)
 
-    examples = build_expert_examples(num_episodes=120)
+    examples = build_expert_examples(num_episodes=40)
     random.shuffle(examples)
     dataset = Dataset.from_list(examples).map(
         lambda row: tokenize_example(row, tokenizer),

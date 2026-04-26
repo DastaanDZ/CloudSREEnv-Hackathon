@@ -40,7 +40,7 @@ def log_dependency_versions() -> None:
             logger.warning(f"{package}: not installed")
 
 
-def build_text_dataset(tokenizer, num_episodes: int = 120) -> Dataset:
+def build_text_dataset(tokenizer, num_episodes: int = 40) -> Dataset:
     examples = build_expert_examples(num_episodes=num_episodes)
     random.shuffle(examples)
 
@@ -134,7 +134,7 @@ def main() -> None:
         random_state=SEED,
     )
 
-    dataset = build_text_dataset(tokenizer, num_episodes=120)
+    dataset = build_text_dataset(tokenizer, num_episodes=40)
     logger.info(f"Built Unsloth SFT dataset with {len(dataset)} expert action examples.")
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     logger.info(f"Training precision: bf16={use_bf16}, fp16={not use_bf16}")
