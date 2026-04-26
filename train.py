@@ -40,8 +40,8 @@ RUN_GRPO_AFTER_SFT = False
 SFT_FINAL_MODEL_PATH = "./grpo_sre_model/final"
 GRPO_MODEL_PATH = "./grpo_sre_model/grpo_final"
 SFT_MAX_LENGTH = 1024
-SFT_MICRO_BATCH_SIZE = 1
-SFT_GRADIENT_ACCUMULATION_STEPS = 8
+SFT_MICRO_BATCH_SIZE = 2
+SFT_GRADIENT_ACCUMULATION_STEPS = 4
 
 if torch.cuda.is_available():
     # A100 supports TF32/BF16 well; this speeds up matmul-heavy training.
@@ -881,6 +881,41 @@ def generate_hard_task_examples():
                 "service_id": "notification-worker",
                 "memory_limit_mb": 2048,
             }),
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker. Fix this issue.",
+            _gold_json({
+                "action_type": "UPDATE_CONFIG",
+                "service_id": "notification-worker",
+                "memory_limit_mb": 2048,
+            }),
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Set payment-db memory limit to 1024 to resolve latency. Correct the target and limit.",
+            _gold_json({
+                "action_type": "UPDATE_CONFIG",
+                "service_id": "notification-worker",
+                "memory_limit_mb": 2048,
+            }),
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Fix checkout latency caused by notification-worker memory pressure.\n"
+            "Obs: [OK] notification-worker memory limit set to 2048MB.",
+            _gold_json({
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "IC",
+                "message": "Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+            }),
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\n"
+            "New message from L1_Triage: Root cause: notification-worker is using 8000MB RAM and starving payment-db. It needs UPDATE_CONFIG memory_limit_mb 2048.\n"
+            "New message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+            _gold_json({"action_type": "CLOSE_INCIDENT"}),
         ),
         (
             "L1_Triage",
