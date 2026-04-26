@@ -87,7 +87,6 @@ class SFTRewardProxyCallback(TrainerCallback):
         }
         self.records.append(record)
         logs["sft_reward_proxy"] = reward_proxy
-        logger.info(f"sft_reward_proxy={reward_proxy:.4f}")
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("w", encoding="utf-8") as f:
