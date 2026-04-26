@@ -86,7 +86,8 @@ Workflow:
 
 Hard rules:
 - Never repeat RESTART, SCALE, UPDATE_CONFIG, or REPAIR_REPLICA after an [OK] observation.
-- If the last observation says [OK], output MESSAGE_CHANNEL to IC.
+- If the last observation says [OK] or [BLOCKED] Duplicate action after a fix, output MESSAGE_CHANNEL to IC.
+- After any successful fix, report completion; do not try another remediation unless IC asks for a different service.
 - L2_DB_SME should not close incidents directly."""
 
 PROMPTS = {

@@ -174,6 +174,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         # Detect context phases. IC histories always keep the original
         # INITIAL ALERT, so explicit later-state evidence must drive scoring.
         has_l1_message = "new message from l1_triage" in prompt_lower
+        has_l2_message = "new message from l2_db_sme" in prompt_lower
         task1_cert_evidence = (
             has_l1_message
             and "auth-api" in prompt_lower
@@ -206,14 +207,16 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             or task1_cert_evidence
             or has_fixable_l1_evidence
         )
-        is_after_fix = any(kw in prompt_lower for kw in [
-            "l2_db_sme confirms", "l2_db_sme reports", "new message from l2_db_sme",
-            "all services now healthy", "fix successfully", "fix applied",
-            "restarted and is now", "restarted.", "scaled to", "memory limit set", "update_config",
-            "repaired", "resynced", "repair_replica"
-        ])
         has_blocked_duplicate = "[blocked] duplicate action" in prompt_lower or "duplicate action" in prompt_lower
         has_ok_observation = "obs: [ok]" in prompt_lower or "[ok]" in prompt_lower
+        is_after_fix = has_ok_observation or (
+            has_l2_message and any(kw in prompt_lower for kw in [
+                "l2_db_sme confirms", "l2_db_sme reports", "all services now healthy",
+                "fix successfully", "fix applied", "restarted and is now", "restarted.",
+                "scaled to", "memory limit set", "update_config", "repaired", "resynced",
+                "repair_replica"
+            ])
+        )
         has_cert_log_evidence = "=== logs: auth-api ===" in prompt_lower and any(kw in prompt_lower for kw in ["tls handshake failed", "certificate has expired", "certificate expired"])
         is_investigation_only = has_cert_log_evidence or task1_cert_evidence or any(kw in prompt_lower for kw in ["no local fix", "no fix available", "expired upstream certificate"])
         
@@ -291,18 +294,21 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             has_reported = any(kw in prompt_lower for kw in 
                 ["found:", "identified", "reports:", "root cause", "report findings"])
             is_login_context = any(kw in prompt_lower for kw in ["login failure", "authentication failure", "authentication flow"])
+            task4_specific_signal = any(kw in prompt_lower for kw in [
+                "8000mb", "node memory pressure", "noisy neighbor", "starving payment-db",
+                "checkout latency on payment-db", "memory leak"
+            ])
             is_resource_contention_context = (
-                any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "node memory pressure", "memory pressure"])
-                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "payment-db", "checkout latency"])
+                task4_specific_signal
+                and any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "payment-db"])
             )
             is_checkout_latency_context = "checkout latency" in prompt_lower or (
                 "payment-db" in prompt_lower and "latency" in prompt_lower
             )
-            has_notification_worker_evidence = (
+            has_notification_worker_log_evidence = (
                 "=== logs: notification-worker ===" in prompt_lower
-                or "notification-worker   running" in prompt_lower
-                or "notification-worker is using 8000mb" in prompt_lower
-                or "notification-worker mem=8000mb" in prompt_lower
+                or "heap growth detected" in prompt_lower
+                or "worker has no memory limit" in prompt_lower
             )
             is_split_brain_context = any(kw in prompt_lower for kw in [
                 "cart total mismatch", "cart_total_mismatch", "session-cache", "cache_epoch", "split-brain"
@@ -331,7 +337,7 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if (
                     is_resource_contention_context
                     and service_id == "notification-worker"
-                    and not has_notification_worker_evidence
+                    and not has_notification_worker_log_evidence
                 ):
                     manual_reward += 0.80
                 elif has_log_content or has_reported:
@@ -361,17 +367,23 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
+                message = str(action_dict.get("message", "")).lower()
                 if target != "IC":
                     manual_reward -= 0.45
                 elif is_checkout_latency_context and not is_resource_contention_context:
                     manual_reward -= 0.65
-                elif is_resource_contention_context and target == "IC" and not has_notification_worker_evidence:
+                elif is_resource_contention_context and target == "IC" and not has_notification_worker_log_evidence:
                     manual_reward -= 0.55
                 elif is_split_brain_context and "session-cache-primary" not in prompt_lower and "session-cache-replica" not in prompt_lower:
                     manual_reward -= 0.55
                 elif has_log_content and target == "IC":
                     # Have log content - correct to report findings to IC
                     manual_reward += 1.10
+                    if is_resource_contention_context:
+                        if "repair_replica" in message or "repair replica" in message:
+                            manual_reward -= 0.85
+                        if "update_config" in message and "notification-worker" in message and "2048" in message:
+                            manual_reward += 0.35
                     if has_blocked_duplicate:
                         manual_reward += 0.25
                     if any(kw in prompt_lower for kw in ["root cause", "report findings", "investigation complete"]):
@@ -395,9 +407,14 @@ def sre_rubric_reward(prompts, completions, **kwargs):
         elif role == "L2_DB_SME":
             fix_already_applied = any(kw in prompt_lower for kw in 
                 ["restarted", "scaled", "fix applied", "recovered", "back online", "memory limit set", "resynced", "repaired", "[ok]"])
+            task4_specific_signal = any(kw in prompt_lower for kw in [
+                "8000mb", "node memory pressure", "noisy neighbor", "starving payment-db",
+                "checkout latency on payment-db", "memory leak", "memory limit to 2048mb",
+                "memory_limit_mb 2048"
+            ])
             is_resource_contention_context = (
-                any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "node memory pressure", "memory pressure", "checkout latency"])
-                and any(kw in prompt_lower for kw in ["8000mb", "memory", "noisy neighbor", "starving", "payment-db", "throttling"])
+                task4_specific_signal
+                and any(kw in prompt_lower for kw in ["notification-worker", "payment-worker", "payment-db"])
             )
             is_split_brain_context = (
                 "session-cache-replica" in prompt_lower
@@ -498,8 +515,13 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                     
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
+                message = str(action_dict.get("message", "")).lower()
                 if fix_already_applied and target == "IC":
                     manual_reward += 1.00
+                    if "duplicate action" in message or "[blocked]" in message:
+                        manual_reward -= 0.80
+                    if "fix applied" in message or "memory limit set" in message or "restarted" in message or "scaled" in message or "repaired" in message:
+                        manual_reward += 0.20
                     if has_ok_observation:
                         manual_reward += 0.20
                     if has_blocked_duplicate:
@@ -864,6 +886,15 @@ def generate_hard_task_examples():
         ),
         (
             "L1_Triage",
+            "New message from IC: Investigate the incident and report root cause.\n"
+            "Obs: auth-api              Running    CPU=1024m MEM=2048MB LAT=370ms\n"
+            "payment-db            Running    CPU=2048m MEM=4096MB LAT=650ms\n"
+            "inventory-svc         Running    CPU=1024m MEM=2048MB LAT=370ms\n"
+            "notification-worker   Running    CPU=1024m MEM=8000MB LAT=180ms",
+            _gold_json({"action_type": "GET_LOGS", "service_id": "notification-worker"}),
+        ),
+        (
+            "L1_Triage",
             "New message from IC: Checkout latency on payment-db.\n"
             "Obs: === Logs: payment-db ===\n"
             "[WARN] query latency elevated due to node memory pressure\n"
@@ -874,6 +905,21 @@ def generate_hard_task_examples():
                 "action_type": "MESSAGE_CHANNEL",
                 "target": "IC",
                 "message": "Root cause: notification-worker is using 8000MB RAM and starving payment-db. It needs UPDATE_CONFIG memory_limit_mb 2048.",
+            }),
+        ),
+        (
+            "L1_Triage",
+            "New message from IC: Checkout latency on payment-db.\n"
+            "Obs: === Logs: payment-db ===\n"
+            "[WARN] query latency elevated due to node memory pressure\n"
+            "Obs: === Logs: notification-worker ===\n"
+            "[WARN] Heap growth detected: notification batch cache at 8000MB\n"
+            "[WARN] Node memory pressure: worker has no memory limit\n"
+            "[SYSTEM] Do not use REPAIR_REPLICA for task4; report UPDATE_CONFIG on notification-worker.",
+            _gold_json({
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "IC",
+                "message": "Root cause: notification-worker is causing node memory pressure and starving payment-db. It needs UPDATE_CONFIG on notification-worker with memory_limit_mb 2048.",
             }),
         ),
         (
@@ -951,6 +997,27 @@ def generate_hard_task_examples():
             }),
         ),
         (
+            "L2_DB_SME",
+            "New message from IC: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker. Notification-worker has extreme memory usage, leading to memory pressure on payment-db.\n"
+            "Obs: [OK] notification-worker memory limit set to 2048MB.",
+            _gold_json({
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "IC",
+                "message": "Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+            }),
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker. Notification-worker has extreme memory usage, leading to memory pressure on payment-db.\n"
+            "Obs: [OK] notification-worker memory limit set to 2048MB.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.",
+            _gold_json({
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "IC",
+                "message": "Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+            }),
+        ),
+        (
             "L1_Triage",
             "New message from IC: Checkout latency on payment-db.\n"
             "Obs: === Logs: payment-db ===\n"
@@ -986,6 +1053,13 @@ def generate_hard_task_examples():
             "IC",
             "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\n"
             "New message from L1_Triage: payment-db is only the symptom. notification-worker is causing node memory pressure.\n"
+            "New message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
+            _gold_json({"action_type": "CLOSE_INCIDENT"}),
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Checkout latency detected on payment-db.\n"
+            "New message from L1_Triage: Checkout latency on payment-db is due to throttling caused by node memory pressure from notification-worker.\n"
             "New message from L2_DB_SME: Fix applied. notification-worker memory limit set to 2048MB and payment-db latency recovered.",
             _gold_json({"action_type": "CLOSE_INCIDENT"}),
         ),
