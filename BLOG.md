@@ -202,7 +202,7 @@ That is the difference between a chatbot that can call APIs and an agent that ca
 
 ## Links
 
-- Hugging Face Space: TODO
-- Colab notebook: TODO
-- GitHub repository: TODO
-- Demo video or slides: TODO
+- Hugging Face Space: https://huggingface.co/spaces/dastaandz/FinalCloudSRE/tree/main
+- Colab notebook: https://colab.research.google.com/drive/1_06Ts3qavU4n_5PucQJZpynbNOCFNNEz#scrollTo=aWu3AC3PGw5f
+- GitHub repository: https://github.com/DastaanDZ/CloudSREEnv-Hackathon
+- Mini-blog / Demo Video: https://huggingface.co/spaces/dastaandz/FinalCloudSRE/blob/main/Blog.md
