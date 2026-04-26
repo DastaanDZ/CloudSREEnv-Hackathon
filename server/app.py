@@ -22,6 +22,8 @@ class ActionType(str, Enum):
     GET_LOGS = "GET_LOGS"
     RESTART = "RESTART"
     SCALE = "SCALE"
+    UPDATE_CONFIG = "UPDATE_CONFIG"
+    REPAIR_REPLICA = "REPAIR_REPLICA"
     MESSAGE_CHANNEL = "MESSAGE_CHANNEL"
     CLOSE_INCIDENT = "CLOSE_INCIDENT"
     INVALID_FORMAT = "INVALID_FORMAT" # NEW: For RL Syntax Penalties
@@ -31,6 +33,7 @@ class Action(BaseModel):
     agent_id: str = "SYSTEM"
     service_id: Optional[str] = None
     cpu_value: Optional[int] = None
+    memory_limit_mb: Optional[int] = None
     target: Optional[str] = None
     message: Optional[str] = None
 
@@ -42,6 +45,7 @@ class ServiceMetrics(BaseModel):
     cpu_allocated: int
     memory_allocated: int
     latency_ms: int
+    cache_epoch: Optional[int] = None
 
 class Observation(BaseModel):
     text_output: str
@@ -75,6 +79,7 @@ class Service:
         self.cpu_allocated = cpu
         self.memory_allocated = mem
         self.latency_ms = lat
+        self.cache_epoch: Optional[int] = None
         self.logs: List[str] = []
         self.error_message: str = ""
 
@@ -82,7 +87,8 @@ class Service:
     def metrics(self) -> ServiceMetrics:
         return ServiceMetrics(
             id=self.id, status=self.status, cpu_allocated=self.cpu_allocated,
-            memory_allocated=self.memory_allocated, latency_ms=self.latency_ms
+            memory_allocated=self.memory_allocated, latency_ms=self.latency_ms,
+            cache_epoch=self.cache_epoch
         )
 
 class MockCloud:
@@ -100,7 +106,12 @@ class MockCloud:
             "payment-db": Service("payment-db", cpu=2048, mem=4096, lat=12),
             "inventory-svc": Service("inventory-svc"),
             "notification-worker": Service("notification-worker", lat=60),
+            "checkout-api": Service("checkout-api", cpu=2048, mem=2048, lat=45),
+            "session-cache-primary": Service("session-cache-primary", cpu=1024, mem=2048, lat=8),
+            "session-cache-replica": Service("session-cache-replica", cpu=1024, mem=2048, lat=8),
         }
+        self.services["session-cache-primary"].cache_epoch = 1842
+        self.services["session-cache-replica"].cache_epoch = 1842
         self.rps = self.RPS_NORMAL
         self.incident_channel = []
 
@@ -110,6 +121,10 @@ class MockCloud:
             self._apply_performance_bottleneck()
         elif scenario == "tls_certificate_expiry":
             self._apply_tls_certificate_expiry()
+        elif scenario == "noisy_neighbor":
+            self._apply_noisy_neighbor()
+        elif scenario == "cache_split_brain":
+            self._apply_cache_split_brain()
 
         self._propagate_failures()
 
@@ -139,6 +154,52 @@ class MockCloud:
             "[WARN] Upstream certificate expired 2 days ago"
         ]
         self.incident_channel.append("[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.")
+
+    def _apply_noisy_neighbor(self):
+        worker = self.services["notification-worker"]
+        worker.memory_allocated = 8000
+        worker.latency_ms = 120
+        worker.logs = [
+            "[WARN] heap usage 8000MB; background batch queue consuming node memory",
+            "[WARN] cgroup memory pressure detected on shared node",
+            "[INFO] low-priority worker can be capped safely"
+        ]
+
+        db = self.services["payment-db"]
+        db.latency_ms = 780
+        db.error_message = "Warning: throttled by node memory pressure; database process is not crashed."
+        db.logs = [
+            "[WARN] queries waiting on node memory reclaim",
+            "[INFO] no CrashLoopBackOff or database corruption detected"
+        ]
+        self.incident_channel.append("[SYSTEM ALERT] Checkout/payment latency: payment-db queries are slow.")
+
+    def _apply_cache_split_brain(self):
+        checkout = self.services["checkout-api"]
+        checkout.latency_ms = 220
+        checkout.error_message = "Warning: intermittent cart/session mismatches reported by checkout clients."
+        checkout.logs = [
+            "[ERROR] cart total mismatch: expected=100 observed=80",
+            "[WARN] session lookup returned stale data from cache replica",
+            "[INFO] checkout-api is a client of session-cache"
+        ]
+
+        primary = self.services["session-cache-primary"]
+        primary.cache_epoch = 1842
+        primary.logs = [
+            "[INFO] cache role=primary",
+            "[INFO] cache_epoch=1842",
+            "[INFO] accepting writes"
+        ]
+
+        replica = self.services["session-cache-replica"]
+        replica.cache_epoch = 1837
+        replica.logs = [
+            "[WARN] cache role=replica serving traffic after partition",
+            "[WARN] cache_epoch=1837",
+            "[ERROR] replica epoch behind primary"
+        ]
+        self.incident_channel.append("[SYSTEM ALERT] Checkout users see intermittent cart/session mismatches.")
 
     def _propagate_failures(self):
         deps = {
@@ -170,6 +231,12 @@ class MockCloud:
             if svc and not svc.error_message:
                 svc.error_message = msg
 
+        worker = self.services.get("notification-worker")
+        db = self.services.get("payment-db")
+        if worker and db and worker.memory_allocated > 4096:
+            db.latency_ms = max(db.latency_ms, 780)
+            db.error_message = "Warning: throttled by node memory pressure; database process is not crashed."
+
 class CloudSREEnv:
     def __init__(self):
         self.cloud = MockCloud()
@@ -194,6 +261,10 @@ class CloudSREEnv:
             self.cloud.reset(scenario="crash_loop")
         elif "task3" in self.current_task:
             self.cloud.reset(scenario="performance_bottleneck")
+        elif "task4" in self.current_task:
+            self.cloud.reset(scenario="noisy_neighbor")
+        elif "task5" in self.current_task:
+            self.cloud.reset(scenario="cache_split_brain")
         else:
             self.cloud.reset(scenario=scenario or "healthy")
 
@@ -242,7 +313,13 @@ class CloudSREEnv:
 
         # --- EXECUTE ACTIONS ---
         if action.action_type == ActionType.LIST_SERVICES:
-            lines = [f"{svc.id:<20} {svc.status:<10} {svc.latency_ms}ms" for svc in self.cloud.services.values()]
+            lines = ["service_id             status     latency  memory_mb  cpu_m  cache_epoch"]
+            for svc in self.cloud.services.values():
+                epoch = "-" if svc.cache_epoch is None else str(svc.cache_epoch)
+                lines.append(
+                    f"{svc.id:<22} {svc.status:<10} {svc.latency_ms:<7} "
+                    f"{svc.memory_allocated:<9} {svc.cpu_allocated:<6} {epoch}"
+                )
             obs_text = "\n".join(lines)
 
         elif action.action_type == ActionType.GET_LOGS:
@@ -280,6 +357,48 @@ class CloudSREEnv:
                         self.cloud._propagate_failures()
                     obs_text = f"[OK] {action.service_id} scaled to {action.cpu_value}m CPU."
 
+        elif action.action_type == ActionType.UPDATE_CONFIG:
+            if action.memory_limit_mb is None:
+                obs_text = "[ERROR] UPDATE_CONFIG requires memory_limit_mb parameter."
+                total_reward -= 0.2
+                breakdown["missing_param_penalty"] = -0.2
+            else:
+                svc = self.cloud.services.get(action.service_id)
+                if not svc:
+                    obs_text = f"[ERROR] Service {action.service_id} not found."
+                    total_reward -= 0.1
+                else:
+                    svc.memory_allocated = action.memory_limit_mb
+                    if action.service_id == "notification-worker" and action.memory_limit_mb <= 2048:
+                        svc.logs = ["[INFO] memory limit applied: 2048MB"]
+                        payment_db = self.cloud.services["payment-db"]
+                        payment_db.latency_ms = 12
+                        payment_db.error_message = ""
+                        payment_db.logs = ["[INFO] payment-db latency recovered after noisy-neighbor cap"]
+                    self.cloud._propagate_failures()
+                    obs_text = f"[OK] {action.service_id} memory limit set to {action.memory_limit_mb}MB."
+
+        elif action.action_type == ActionType.REPAIR_REPLICA:
+            svc = self.cloud.services.get(action.service_id)
+            if not svc:
+                obs_text = f"[ERROR] Service {action.service_id} not found."
+                total_reward -= 0.1
+            elif action.service_id != "session-cache-replica":
+                obs_text = f"[WARN] {action.service_id} is not the stale cache replica."
+                total_reward -= 0.2
+            else:
+                primary = self.cloud.services["session-cache-primary"]
+                svc.cache_epoch = primary.cache_epoch
+                svc.logs = [
+                    f"[INFO] replica repaired and synced to cache_epoch={svc.cache_epoch}",
+                    "[INFO] stale replica removed from split-brain state"
+                ]
+                checkout = self.cloud.services["checkout-api"]
+                checkout.latency_ms = 45
+                checkout.error_message = ""
+                checkout.logs = ["[INFO] cart/session mismatches resolved after replica repair"]
+                obs_text = "[OK] session-cache-replica repaired and resynced with primary."
+
         elif action.action_type == ActionType.MESSAGE_CHANNEL:
             msg = f"[{action.agent_id} -> {action.target}]: {action.message}"
             self.cloud.incident_channel.append(msg)
@@ -315,15 +434,18 @@ class CloudSREEnv:
         """Per-type identity used for hard-duplicate detection.
 
         - LIST_SERVICES: (type, agent)
-        - GET_LOGS / RESTART: (type, agent, service)
+        - GET_LOGS / RESTART / REPAIR_REPLICA: (type, agent, service)
         - SCALE: (type, agent, service, cpu_value)  -- different cpu_value is allowed
+        - UPDATE_CONFIG: (type, agent, service, memory_limit_mb)
         - MESSAGE_CHANNEL: (type, agent, target)    -- message text intentionally ignored
         """
         if action.action_type == ActionType.SCALE:
             return (action.action_type, action.agent_id, action.service_id, action.cpu_value)
+        if action.action_type == ActionType.UPDATE_CONFIG:
+            return (action.action_type, action.agent_id, action.service_id, action.memory_limit_mb)
         if action.action_type == ActionType.MESSAGE_CHANNEL:
             return (action.action_type, action.agent_id, action.target)
-        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART):
+        if action.action_type in (ActionType.GET_LOGS, ActionType.RESTART, ActionType.REPAIR_REPLICA):
             return (action.action_type, action.agent_id, action.service_id)
         return (action.action_type, action.agent_id)
 
@@ -364,6 +486,23 @@ class CloudSREEnv:
                 "remediation_service": "auth-api",
                 "min_cpu": 2048,
             }
+        if "task4" in self.current_task:
+            return {
+                "evidence_service": "notification-worker",
+                "root_cause": "notification-worker noisy neighbor memory pressure",
+                "fixability": "fixable",
+                "remediation_action": ActionType.UPDATE_CONFIG,
+                "remediation_service": "notification-worker",
+                "max_memory_mb": 2048,
+            }
+        if "task5" in self.current_task:
+            return {
+                "evidence_service": "session-cache-replica",
+                "root_cause": "session-cache-replica stale cache epoch split-brain",
+                "fixability": "fixable",
+                "remediation_action": ActionType.REPAIR_REPLICA,
+                "remediation_service": "session-cache-replica",
+            }
         return {
             "evidence_service": None,
             "root_cause": None,
@@ -387,6 +526,9 @@ class CloudSREEnv:
         if action.action_type == ActionType.SCALE:
             min_cpu = int(self.scenario_profile.get("min_cpu", 0) or 0)
             return bool(action.cpu_value is not None and action.cpu_value >= min_cpu)
+        if action.action_type == ActionType.UPDATE_CONFIG:
+            max_memory = int(self.scenario_profile.get("max_memory_mb", 0) or 0)
+            return bool(action.memory_limit_mb is not None and action.memory_limit_mb <= max_memory)
         return True
 
     def _calculate_principle_reward(
@@ -458,7 +600,12 @@ class CloudSREEnv:
                     breakdown["principle_l2_report_without_fix"] = -0.12
                     reward -= 0.12
 
-        elif action.action_type in (ActionType.RESTART, ActionType.SCALE):
+        elif action.action_type in (
+            ActionType.RESTART,
+            ActionType.SCALE,
+            ActionType.UPDATE_CONFIG,
+            ActionType.REPAIR_REPLICA,
+        ):
             self.incident_state.remediation_attempted = True
             if state_before.fixability == "unknown" or state_before.confidence_level < 0.5:
                 breakdown["principle_remediate_before_diagnosis"] = -0.30
@@ -511,7 +658,12 @@ class CloudSREEnv:
             reason = "Communicated in channel."
 
         # 3. RBAC Rubric (Strictly enforce roles)
-        if action.action_type in [ActionType.RESTART, ActionType.SCALE]:
+        if action.action_type in [
+            ActionType.RESTART,
+            ActionType.SCALE,
+            ActionType.UPDATE_CONFIG,
+            ActionType.REPAIR_REPLICA,
+        ]:
             if action.agent_id != "L2_DB_SME":
                 return -0.5, {"rbac_penalty": -0.5}, "Unauthorized cluster modification."
             else:
@@ -529,10 +681,16 @@ class CloudSREEnv:
     # --- TERMINAL GRADER (Task Success) ---
     def _grade_terminal_state(self) -> tuple[bool, float]:
         """Evaluates if the final state matches the scenario objective."""
+        remediation_actions = (
+            ActionType.RESTART,
+            ActionType.SCALE,
+            ActionType.UPDATE_CONFIG,
+            ActionType.REPAIR_REPLICA,
+        )
         if "task1" in self.current_task:
-            # TLS Certificate RCA: GET_LOGS(auth-api) happened AND no RESTART/SCALE
+            # TLS Certificate RCA: GET_LOGS(auth-api) happened AND no remediation
             found_logs = any(a.action_type == ActionType.GET_LOGS and a.service_id == "auth-api" for a in self.action_history)
-            no_remediation = not any(a.action_type in [ActionType.RESTART, ActionType.SCALE] for a in self.action_history)
+            no_remediation = not any(a.action_type in remediation_actions for a in self.action_history)
             return (True, 0.8) if (found_logs and no_remediation) else (False, 0.0)
             
         elif "task2" in self.current_task:
@@ -541,6 +699,69 @@ class CloudSREEnv:
         elif "task3" in self.current_task:
             svc = self.cloud.services["auth-api"]
             return (True, 1.0) if svc.cpu_allocated >= 2048 and svc.latency_ms < 100 else (False, 0.0)
+
+        elif "task4" in self.current_task:
+            worker = self.cloud.services["notification-worker"]
+            db = self.cloud.services["payment-db"]
+            listed_services = any(
+                a.action_type == ActionType.LIST_SERVICES and a.agent_id == "L1_Triage"
+                for a in self.action_history
+            )
+            found_worker_logs = any(
+                a.action_type == ActionType.GET_LOGS and a.service_id == "notification-worker"
+                for a in self.action_history
+            )
+            capped_worker = any(
+                a.action_type == ActionType.UPDATE_CONFIG
+                and a.service_id == "notification-worker"
+                and a.memory_limit_mb is not None
+                and a.memory_limit_mb <= 2048
+                for a in self.action_history
+            )
+            wrong_db_fix = any(
+                a.action_type in (ActionType.RESTART, ActionType.SCALE)
+                and a.service_id == "payment-db"
+                for a in self.action_history
+            )
+            success = listed_services and found_worker_logs and capped_worker and not wrong_db_fix and worker.memory_allocated <= 2048 and db.latency_ms < 100
+            return (True, 1.0) if success else (False, 0.0)
+
+        elif "task5" in self.current_task:
+            primary = self.cloud.services["session-cache-primary"]
+            replica = self.cloud.services["session-cache-replica"]
+            listed_services = any(
+                a.action_type == ActionType.LIST_SERVICES and a.agent_id == "L1_Triage"
+                for a in self.action_history
+            )
+            required_logs = {"checkout-api", "session-cache-primary", "session-cache-replica"}
+            collected_logs = {
+                a.service_id
+                for a in self.action_history
+                if a.action_type == ActionType.GET_LOGS and a.service_id
+            }
+            repaired_replica = any(
+                a.action_type == ActionType.REPAIR_REPLICA and a.service_id == "session-cache-replica"
+                for a in self.action_history
+            )
+            wrong_checkout_fix = any(
+                a.action_type in (ActionType.RESTART, ActionType.SCALE)
+                and a.service_id == "checkout-api"
+                for a in self.action_history
+            )
+            wrong_cache_config = any(
+                a.action_type == ActionType.UPDATE_CONFIG
+                and a.service_id in {"session-cache-primary", "session-cache-replica"}
+                for a in self.action_history
+            )
+            success = (
+                listed_services
+                and required_logs.issubset(collected_logs)
+                and repaired_replica
+                and not wrong_checkout_fix
+                and not wrong_cache_config
+                and primary.cache_epoch == replica.cache_epoch
+            )
+            return (True, 1.0) if success else (False, 0.0)
             
         return False, 0.0
 

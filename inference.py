@@ -244,7 +244,16 @@ def generate_action(agent_role: str, history: str, model, tokenizer) -> str:
 def suggested_l1_log_action(history: str, task_id: str) -> str:
     """Return the exact GET_LOGS action L1 should take before reporting."""
     history_lower = history.lower()
-    if "task2" in task_id or "payment-db" in history_lower or "oom" in history_lower or "crash" in history_lower:
+    if "task5" in task_id:
+        if "checkout-api" not in history_lower:
+            service_id = "checkout-api"
+        elif "session-cache-primary" not in history_lower:
+            service_id = "session-cache-primary"
+        else:
+            service_id = "session-cache-replica"
+    elif "task4" in task_id:
+        service_id = "notification-worker"
+    elif "task2" in task_id or "payment-db" in history_lower or "oom" in history_lower or "crash" in history_lower:
         service_id = "payment-db"
     else:
         service_id = "auth-api"
@@ -277,6 +286,27 @@ def required_l2_delegation(env: CloudSREEnv, task_id: str) -> dict | None:
             "target": "L2_DB_SME",
             "message": "Root cause is auth-api CPU saturation. Scale auth-api to 2048 CPU.",
         }
+    if "task4" in task_id and any(
+        a.action_type == ActionType.GET_LOGS and a.service_id == "notification-worker"
+        for a in env.action_history
+    ):
+        return {
+            "action_type": "MESSAGE_CHANNEL",
+            "target": "L2_DB_SME",
+            "message": "Root cause is notification-worker noisy-neighbor memory pressure. Set memory_limit_mb to 2048.",
+        }
+    if "task5" in task_id:
+        logged_services = {
+            a.service_id
+            for a in env.action_history
+            if a.action_type == ActionType.GET_LOGS
+        }
+        if {"checkout-api", "session-cache-primary", "session-cache-replica"}.issubset(logged_services):
+            return {
+                "action_type": "MESSAGE_CHANNEL",
+                "target": "L2_DB_SME",
+                "message": "Root cause is stale session-cache-replica after split-brain. Repair session-cache-replica.",
+            }
     return None
 
 def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
@@ -291,6 +321,19 @@ def l2_fix_applied(env: CloudSREEnv, task_id: str) -> bool:
             a.action_type == ActionType.SCALE and a.service_id == "auth-api"
             for a in env.action_history
         )
+    if "task4" in task_id:
+        return any(
+            a.action_type == ActionType.UPDATE_CONFIG
+            and a.service_id == "notification-worker"
+            and a.memory_limit_mb is not None
+            and a.memory_limit_mb <= 2048
+            for a in env.action_history
+        )
+    if "task5" in task_id:
+        return any(
+            a.action_type == ActionType.REPAIR_REPLICA and a.service_id == "session-cache-replica"
+            for a in env.action_history
+        )
     return False
 
 def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
@@ -298,7 +341,12 @@ def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
     if "task1" in task_id:
         has_auth_logs = task1_has_required_evidence(env, task_id)
         no_remediation = not any(
-            a.action_type in (ActionType.RESTART, ActionType.SCALE)
+            a.action_type in (
+                ActionType.RESTART,
+                ActionType.SCALE,
+                ActionType.UPDATE_CONFIG,
+                ActionType.REPAIR_REPLICA,
+            )
             for a in env.action_history
         )
         if has_auth_logs and no_remediation:
@@ -307,6 +355,10 @@ def solved_close_reason(env: CloudSREEnv, task_id: str) -> str | None:
         return "task2 remediation complete: payment-db was restarted."
     elif "task3" in task_id and l2_fix_applied(env, task_id):
         return "task3 remediation complete: auth-api was scaled."
+    elif "task4" in task_id and l2_fix_applied(env, task_id):
+        return "task4 remediation complete: notification-worker memory was capped."
+    elif "task5" in task_id and l2_fix_applied(env, task_id):
+        return "task5 remediation complete: stale cache replica was repaired."
     return None
 
 def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
@@ -399,7 +451,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                     agent_histories[current_agent] += f"\n[SYSTEM] Do not repeat or report yet. Your next action must be exactly: {next_action}"
             elif current_agent == "L2_DB_SME":
                 last_l2_key = recent_actions[current_agent][-1]
-                if "RESTART" in last_l2_key or "SCALE" in last_l2_key:
+                if any(action_name in last_l2_key for action_name in ("RESTART", "SCALE", "UPDATE_CONFIG", "REPAIR_REPLICA")):
                     agent_histories[current_agent] += "\n[SYSTEM] Fix already applied successfully. Do NOT repeat it. Report completion to IC now: {\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
                 else:
                     agent_histories[current_agent] += "\n[SYSTEM] Fix already attempted. Report status to IC using MESSAGE_CHANNEL."
@@ -477,7 +529,12 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
         if (not STRICT_EVAL
                 and current_agent == "L2_DB_SME"
                 and l2_fix_applied(env, task_id)
-                and action.action_type in (ActionType.RESTART, ActionType.SCALE)):
+                and action.action_type in (
+                    ActionType.RESTART,
+                    ActionType.SCALE,
+                    ActionType.UPDATE_CONFIG,
+                    ActionType.REPAIR_REPLICA,
+                )):
             logger.warning("L2 fix already applied; blocking repeated remediation.")
             recent_actions[current_agent].pop()
             record_trace_event(
@@ -489,7 +546,7 @@ def run_multi_agent_task(env: CloudSREEnv, task_id: str, model, tokenizer):
                 guardrail_reason="L2 remediation was already applied; repeated fix blocked.",
             )
             agent_histories[current_agent] += (
-                "\n[SYSTEM] Fix already applied. Do not repeat RESTART or SCALE. "
+                "\n[SYSTEM] Fix already applied. Do not repeat remediation. "
                 "Report completion with exactly: "
                 "{\"action_type\": \"MESSAGE_CHANNEL\", \"target\": \"IC\", \"message\": \"Fix applied.\"}"
             )
@@ -608,7 +665,13 @@ def main():
     
     # 2. Run scenarios
     env = CloudSREEnv()
-    tasks = ["task1_tls_certificate_rca", "task2_self_healing", "task3_latency_resolution"]
+    tasks = [
+        "task1_tls_certificate_rca",
+        "task2_self_healing",
+        "task3_latency_resolution",
+        "task4_noisy_neighbor",
+        "task5_cache_split_brain",
+    ]
     
     results = {}
     for task in tasks:
