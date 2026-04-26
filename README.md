@@ -266,13 +266,9 @@ python scripts/generate_readme_assets.py
 
 Caption: SFT loss over training steps. Lower loss indicates the model learned to emit structured expert actions.
 
-![BASE vs SFT Pass Rate](assets/base_vs_sft_pass_rate.png)
+![Reward Progress](assets/reward_progress.png)
 
-Caption: Strict evaluation pass rate comparing the base model and trained SFT adapter.
-
-![In-template vs Held-out Pass Rate](assets/heldout_pass_rate.png)
-
-Caption: Held-out evaluation uses paraphrased alerts and randomized values to test generalization instead of memorization.
+Caption: Training-time SFT reward proxy from Unsloth logs. It is computed as `exp(-loss)`, so it rises toward `1.0` as the model learns to emit expert actions. This is separate from the OpenEnv terminal reward used during strict evaluation.
 
 ---
 

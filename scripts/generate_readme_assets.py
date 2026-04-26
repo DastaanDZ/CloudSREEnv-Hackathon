@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = ROOT / "assets"
 BENCHMARK_PATH = ROOT / "episode_traces" / "benchmark_results.json"
+UNSLOTH_METRICS_PATH = ROOT / "training_metrics" / "unsloth_training_metrics.json"
 
 
 SFT_LOSS_POINTS = [
@@ -72,10 +73,24 @@ def load_benchmark_results() -> dict:
         return json.load(f)
 
 
+def load_unsloth_metrics() -> list[dict]:
+    if not UNSLOTH_METRICS_PATH.exists():
+        return []
+    with UNSLOTH_METRICS_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def save_loss_plot() -> None:
+    unsloth_metrics = load_unsloth_metrics()
+    if unsloth_metrics:
+        steps = [row["step"] for row in unsloth_metrics]
+        losses = [row["loss"] for row in unsloth_metrics]
+    else:
+        steps = list(range(1, len(SFT_LOSS_POINTS) + 1))
+        losses = SFT_LOSS_POINTS
+
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    steps = list(range(1, len(SFT_LOSS_POINTS) + 1))
-    ax.plot(steps, SFT_LOSS_POINTS, marker="o", linewidth=2)
+    ax.plot(steps, losses, marker="o", linewidth=2)
     ax.set_title("SFT Training Loss")
     ax.set_xlabel("Logged training step")
     ax.set_ylabel("Loss")
@@ -83,6 +98,30 @@ def save_loss_plot() -> None:
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(ASSETS_DIR / "sft_training_loss.png", dpi=160)
+    plt.close(fig)
+
+
+def save_reward_progress_plot() -> None:
+    unsloth_metrics = load_unsloth_metrics()
+    if unsloth_metrics:
+        steps = [row["step"] for row in unsloth_metrics]
+        rewards = [row["sft_reward_proxy"] for row in unsloth_metrics]
+        subtitle = "Training-time SFT reward proxy from Unsloth logs: exp(-loss)."
+    else:
+        steps = list(range(1, len(SFT_LOSS_POINTS) + 1))
+        rewards = [2.718281828 ** (-max(loss, 0.0)) for loss in SFT_LOSS_POINTS]
+        subtitle = "Fallback proxy from previous SFT loss log. Re-run Unsloth training to refresh."
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(steps, rewards, marker="o", linewidth=2)
+    ax.set_title("SFT Reward Proxy During Training")
+    ax.set_xlabel("Logged training step")
+    ax.set_ylabel("Reward proxy (0 to 1)")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    fig.text(0.5, 0.01, subtitle, ha="center", fontsize=8)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(ASSETS_DIR / "reward_progress.png", dpi=160)
     plt.close(fig)
 
 
@@ -133,8 +172,7 @@ def main() -> None:
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
     benchmark = load_benchmark_results()
     save_loss_plot()
-    save_pass_rate_plot(benchmark)
-    save_heldout_plot(benchmark)
+    save_reward_progress_plot()
     print(f"Generated README assets in {ASSETS_DIR}")
 
 

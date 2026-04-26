@@ -13,12 +13,15 @@ Colab install:
 from __future__ import annotations
 
 import logging
+import json
+import math
 import random
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 import torch
 from datasets import Dataset
-from transformers import TrainingArguments
+from transformers import TrainerCallback, TrainingArguments
 
 from prompts import PROMPTS
 from train_sft import MAX_LENGTH, MODEL_NAME, OUTPUT_DIR, SEED, build_expert_examples
@@ -26,6 +29,7 @@ from train_sft import MAX_LENGTH, MODEL_NAME, OUTPUT_DIR, SEED, build_expert_exa
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("UnslothSFT")
+METRICS_OUTPUT_PATH = Path("./training_metrics/unsloth_training_metrics.json")
 
 
 def log_dependency_versions() -> None:
@@ -55,6 +59,39 @@ def build_text_dataset(tokenizer, num_episodes: int = 120) -> Dataset:
             )
         })
     return Dataset.from_list(rows)
+
+
+class SFTRewardProxyCallback(TrainerCallback):
+    """Log a bounded SFT reward proxy derived from loss for README plotting.
+
+    This is not the OpenEnv environment reward. It is a training-time proxy:
+    lower supervised loss means the model is more likely to emit the expert
+    action, so exp(-loss) moves toward 1 as SFT improves.
+    """
+
+    def __init__(self, output_path: Path):
+        self.output_path = output_path
+        self.records: list[dict] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "loss" not in logs:
+            return
+
+        loss = float(logs["loss"])
+        reward_proxy = math.exp(-max(loss, 0.0))
+        record = {
+            "step": int(state.global_step),
+            "epoch": None if state.epoch is None else float(state.epoch),
+            "loss": loss,
+            "sft_reward_proxy": reward_proxy,
+        }
+        self.records.append(record)
+        logs["sft_reward_proxy"] = reward_proxy
+        logger.info(f"sft_reward_proxy={reward_proxy:.4f}")
+
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.output_path.open("w", encoding="utf-8") as f:
+            json.dump(self.records, f, indent=2)
 
 
 def main() -> None:
@@ -120,6 +157,7 @@ def main() -> None:
             optim="adamw_8bit",
             seed=SEED,
         ),
+        callbacks=[SFTRewardProxyCallback(METRICS_OUTPUT_PATH)],
     )
 
     logger.info("\n========== STARTING UNSLOTH SFT TRAINING ==========")
