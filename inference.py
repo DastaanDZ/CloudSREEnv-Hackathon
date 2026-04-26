@@ -45,6 +45,7 @@ SFT_MODEL_PATH = "./sft_sre_model/final"
 BASE_MODEL_NAME ="Qwen/Qwen2.5-3B-Instruct"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TRACE_OUTPUT_DIR = "./episode_traces"
+WRITE_EPISODE_TRACES = os.getenv("WRITE_EPISODE_TRACES", "false").lower() in {"1", "true", "yes", "y"}
 
 # ---------------------------------------------------------------------------
 # 3. CORE EVALUATION FUNCTIONS (Encapsulated)
@@ -117,21 +118,24 @@ def record_trace_event(
 
 
 def save_episode_trace(trace: dict, success: bool) -> None:
-    os.makedirs(TRACE_OUTPUT_DIR, exist_ok=True)
     trace["success"] = success
     trace["ended_at"] = datetime.utcnow().isoformat() + "Z"
     trace["total_reward"] = sum(
         event["reward"] for event in trace["events"] if event["reward"] is not None
     )
+    if not WRITE_EPISODE_TRACES:
+        logger.info(
+            f"Episode trace kept in memory only for {trace['task_id']} "
+            "(set WRITE_EPISODE_TRACES=1 to write latest trace files)."
+        )
+        return
 
     safe_task = re.sub(r"[^a-zA-Z0-9_.-]+", "_", trace["task_id"])
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    base_path = os.path.join(TRACE_OUTPUT_DIR, f"{timestamp}_{safe_task}")
+    os.makedirs(TRACE_OUTPUT_DIR, exist_ok=True)
     latest_path = os.path.join(TRACE_OUTPUT_DIR, f"latest_{safe_task}")
 
-    for json_path in (base_path + ".json", latest_path + ".json"):
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(trace, f, indent=2)
+    with open(latest_path + ".json", "w", encoding="utf-8") as f:
+        json.dump(trace, f, indent=2)
 
     lines = [
         f"# Episode Trace: {trace['task_id']}",
@@ -173,12 +177,11 @@ def save_episode_trace(trace: dict, success: bool) -> None:
         lines.append("")
 
     markdown = "\n".join(lines)
-    for md_path in (base_path + ".md", latest_path + ".md"):
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write(markdown)
+    with open(latest_path + ".md", "w", encoding="utf-8") as f:
+        f.write(markdown)
 
     logger.info(
-        f"Episode trace saved to {base_path}.json/.md and latest files at {latest_path}.json/.md"
+        f"Latest episode trace saved to {latest_path}.json/.md"
     )
 
 

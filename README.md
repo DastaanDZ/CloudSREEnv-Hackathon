@@ -278,23 +278,34 @@ Caption: Held-out evaluation uses paraphrased alerts and randomized values to te
 
 ## Episode Trace Dashboard
 
-Each inference run writes JSON and Markdown traces under:
+Normal inference does **not** write per-episode trace files by default. This prevents `episode_traces/` from filling up with timestamped files after every run.
+
+The main benchmark artifact is:
 
 ```bash
-episode_traces/
+episode_traces/benchmark_results.json
 ```
 
-Latest files are overwritten for quick inspection:
+Generate it explicitly with:
 
 ```bash
-episode_traces/latest_task1_tls_certificate_rca.md
-episode_traces/latest_task2_self_healing.md
-episode_traces/latest_task3_latency_resolution.md
-episode_traces/latest_task4_noisy_neighbor.md
-episode_traces/latest_task5_cache_split_brain.md
+python scripts/evaluate_benchmarks.py
 ```
 
-These traces show:
+If you want optional per-task trace files for debugging, enable them manually:
+
+```bash
+WRITE_EPISODE_TRACES=1 python inference.py
+```
+
+When enabled, only stable latest files are written and overwritten:
+
+```bash
+episode_traces/latest_<task_id>.json
+episode_traces/latest_<task_id>.md
+```
+
+Optional traces show:
 
 - agent role per step,
 - raw model reply,
