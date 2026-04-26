@@ -101,6 +101,9 @@ def plot_loss(runs):
     plt.tight_layout()
     plt.savefig(output_file, dpi=180, bbox_inches="tight")
     print(f"Saved loss plot to {output_file}")
+    
+    # --- ADDED THIS LINE ---
+    plt.show()
 
 
 def plot_reward_proxy(runs):
@@ -127,6 +130,9 @@ def plot_reward_proxy(runs):
     plt.tight_layout()
     plt.savefig(reward_output_file, dpi=180, bbox_inches="tight")
     print(f"Saved reward proxy plot to {reward_output_file}")
+    
+    # --- ADDED THIS LINE ---
+    plt.show()
 
 
 def main():
