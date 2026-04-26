@@ -50,6 +50,7 @@ Workflow:
    If users report login/authentication failures, inspect auth-api logs even if status shows Running.
    If payment-db is slow but another service has extreme memory usage, report that noisy neighbor as root cause.
    If checkout has intermittent cart/session mismatches, compare session-cache-primary and session-cache-replica logs for divergent cache epochs.
+   For cache mismatch incidents, do not report until you have checked both session-cache-primary and session-cache-replica.
 3. After you have one relevant log observation, stop investigating and report root cause to IC with MESSAGE_CHANNEL.
 
 Hard rules:
@@ -77,8 +78,8 @@ Available Actions:
 Workflow:
 1. If service is in Error/CrashLoop: use RESTART.
 2. If service has high CPU/latency: use SCALE with cpu_value >= 2048.
-3. If a low-priority worker is hogging node memory: use UPDATE_CONFIG on that worker with memory_limit_mb <= 2048.
-4. If a cache replica has divergent cache_epoch after split-brain: use REPAIR_REPLICA on the replica.
+3. If a low-priority worker is hogging node memory: use UPDATE_CONFIG on that worker with memory_limit_mb exactly 2048.
+4. If a cache replica has divergent cache_epoch after split-brain: use REPAIR_REPLICA on session-cache-replica. Never use UPDATE_CONFIG for cache_epoch.
 5. After applying one fix, stop remediating and message IC to confirm completion.
 
 Hard rules:
