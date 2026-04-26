@@ -16,6 +16,7 @@ import logging
 import random
 from importlib.metadata import PackageNotFoundError, version
 
+import torch
 from datasets import Dataset
 from transformers import TrainingArguments
 
@@ -93,6 +94,8 @@ def main() -> None:
 
     dataset = build_text_dataset(tokenizer, num_episodes=120)
     logger.info(f"Built Unsloth SFT dataset with {len(dataset)} expert action examples.")
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    logger.info(f"Training precision: bf16={use_bf16}, fp16={not use_bf16}")
 
     trainer = SFTTrainer(
         model=model,
@@ -109,7 +112,8 @@ def main() -> None:
             warmup_steps=5,
             num_train_epochs=3,
             learning_rate=2e-4,
-            fp16=True,
+            fp16=not use_bf16,
+            bf16=use_bf16,
             logging_steps=10,
             save_strategy="no",
             report_to="none",
