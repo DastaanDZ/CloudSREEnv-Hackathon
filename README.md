@@ -63,10 +63,10 @@ The environment is designed to teach an LLM to:
 The current training approach is **SFT-first**:
 
 ```text
-Base model -> SFT on expert trajectories -> strict evaluation -> optional GRPO refinement
+Base model -> LoRA SFT on expert trajectories -> strict evaluation (no scripted controller)
 ```
 
-GRPO is intentionally not the main claim right now. SFT teaches the workflow reliably; GRPO can later refine robustness, efficiency, and reward optimization.
+Supervised fine-tuning teaches the multi-step incident workflow directly from demonstrations; evaluation uses the same environment reward and terminal graders as production runs.
 
 ---
 
@@ -75,16 +75,26 @@ GRPO is intentionally not the main claim right now. SFT teaches the workflow rel
 ```text
 CloudSREEnv/
 ├── server/
-│   ├── app.py             # OpenEnv environment, simulator, rewards, terminal graders
-│   └── __init__.py
+│   └── app.py             # OpenEnv environment, simulator, rewards, terminal graders
+├── scripts/
+│   ├── evaluate_benchmarks.py      # BASE/SFT in-template and held-out benchmark suite -> episode_traces/benchmark_results.json
+│   ├── generate_readme_assets.py   # Loss + reward proxy plots for README -> assets/
+│   ├── generate_benchmark_plot.py  # Benchmark pass-rate plots from benchmark_results.json -> assets/, training_logs/
+│   └── unsloth_train_loss_epoch_plot.py  # Standalone plots from unsloth_training_metrics.json -> assets/
 ├── prompts.py             # Shared IC / L1 / L2 prompts
 ├── train.py               # SFT-first entry point
 ├── train_sft.py           # Transformers/PEFT SFT trainer
 ├── train_unsloth.py       # Colab-friendly Unsloth 4-bit LoRA SFT trainer
-├── inference.py           # BASE / SFT / TRAINED evaluator
-├── scripts/               # Benchmark and plot helpers
+├── inference.py           # BASE vs SFT adapter evaluator
 ├── openenv.yaml           # OpenEnv task metadata
+├── requirements.txt       # pip dependencies for local / Space runtime
+├── pyproject.toml         # uv / project metadata
+├── uv.lock                # Locked dependency versions (uv)
 ├── Dockerfile             # Hugging Face Space container
+├── .dockerignore          # Docker build context exclusions
+├── BLOG.md                # Longer-form writeup (companion to README)
+├── assets/                # Optional; created by plot scripts (loss, reward, benchmark figures)
+├── episode_traces/        # benchmark_results.json, optional traces, Unsloth metrics (created at runtime)
 └── README.md
 ```
 
@@ -96,7 +106,7 @@ CloudSREEnv/
 
 - `reset(task_id)` to start an incident,
 - `step(action)` to execute structured actions,
-- `state()` / `GET /state` for dashboard/debug visibility,
+- `state()` / `GET /state` for dashboard/debug visibility (full simulator snapshot),
 - observations from logs and service tables,
 - dense rewards from composable rubrics,
 - deterministic terminal grading for task success.
@@ -157,16 +167,25 @@ This makes the environment harder to game than simple “restart the failing ser
 
 ## Reward Design
 
-The reward logic is implemented in `server/app.py` using composable signals:
+All step rewards are computed in `CloudSREEnv.step()` in `server/app.py`. Each `POST /step` returns a scalar in **[-1.0, 1.0]** plus a `breakdown` dictionary for logging and traces.
 
-- **Tool-use reward** for useful diagnostic actions.
-- **Collaboration reward** for correct role handoff.
-- **RBAC enforcement** so L1 cannot mutate infrastructure.
-- **Principle reward** for new evidence, confidence gain, correct fixability classification, and correct remediation timing.
-- **Duplicate-action penalty** to discourage repeated useless actions.
-- **Terminal graders** that verify the final environment state, not just message text.
+### How a step is scored
 
-This makes the environment suitable for both supervised training and future RL refinement.
+1. **Episode limits** — If the episode is already done or `max_steps` is exceeded, the step returns reward `0.0` and terminates.
+
+2. **Hard duplicate block** — Before the action is recorded or executed, `_is_duplicate()` compares the action to prior steps (same type, agent, service, parameters where relevant). Duplicates return **-0.4** immediately (`duplicate_block`); `INVALID_FORMAT` and `CLOSE_INCIDENT` are exempt so parsing and closure logic always run.
+
+3. **Rubric base (`_calculate_rubric`)** — Seeds `total_reward` and `breakdown`: small positive **tool_discovery** (+0.05) for `LIST_SERVICES` / `GET_LOGS`; **collaboration** (+0.1) for `MESSAGE_CHANNEL`; **authorized_action** (+0.2) when L2 runs a mutating action; **-0.5** for invalid JSON or RBAC violations (non-L2 attempting restart/scale/config/replica repair). A small **time_penalty** (`-0.02 * steps_taken`) encourages efficiency.
+
+4. **Action execution** — Mutating actions may apply extra penalties on failure (e.g. unknown service, healthy restart, missing `cpu_value` / `memory_limit_mb`); successful state transitions update the simulated cloud.
+
+5. **Principle shaping (`_calculate_principle_reward`)** — After execution, task-agnostic signals update `IncidentState`: rewards for new observations (e.g. first service list, first log fetch per service), **confidence** and **fixability** when logs match the scenario’s evidence service, penalties for irrelevant logs or messaging out of order (report without evidence, L2 delegation too early, wrong remediation vs `scenario_profile`). Remediation actions compare against the expected action/service/thresholds (e.g. scale CPU, memory cap, replica repair).
+
+6. **`CLOSE_INCIDENT`** — Principle rewards for closing only when ready; `_grade_terminal_state()` checks task-specific success (evidence, correct fix, no trap actions). Success adds **task_completion** to the total; premature close adds **false_closure_penalty** (-0.5).
+
+7. **Clamp** — `max(-1.0, min(1.0, total_reward))` before returning.
+
+This is the **environment reward** used when the agent interacts with the simulator. It is separate from the **training-only** metric `exp(-loss)` logged during Unsloth SFT (see Results below), which does not drive `step()` and is only a proxy for how well the model fits the expert demonstrations.
 
 ---
 
@@ -178,10 +197,9 @@ This makes the environment suitable for both supervised training and future RL r
 Qwen/Qwen2.5-3B-Instruct
     -> LoRA SFT on expert SRE trajectories
     -> strict evaluation without controller guardrails
-    -> optional GRPO reward refinement later
 ```
 
-SFT is used first because the model must learn the workflow structure before RL rewards can reliably refine it.
+SFT aligns the model with expert JSON actions and channel messages; strict evaluation then measures whether it follows the real environment rules without scripted transitions.
 
 ### Standard SFT Training
 
@@ -216,9 +234,8 @@ python inference.py
 `inference.py` supports:
 
 ```bash
-EVAL_MODE = "BASE"     # raw base model
-EVAL_MODE = "SFT"      # SFT adapter from ./sft_sre_model/final
-EVAL_MODE = "TRAINED"  # optional GRPO adapter from ./grpo_sre_model/final
+EVAL_MODE = "BASE"     # raw base model (no adapter)
+EVAL_MODE = "SFT"      # LoRA adapter from ./sft_sre_model/final
 ```
 
 Strict mode is enabled by default:
@@ -267,21 +284,6 @@ assets/
 ---
 
 ## Results
-
-### Strict Evaluation Summary
-
-Fill this table after rerunning `BASE` and retrained `SFT` on the current 5-task version.
-
-| Task | BASE Strict | SFT Strict | Notes |
-|---|---:|---:|---|
-| TLS Certificate RCA | TBD | TBD | RCA-only, no local remediation |
-| Self-Healing | TBD | TBD | Restart `payment-db` |
-| Latency Resolution | TBD | TBD | Scale `auth-api` |
-| Noisy Neighbor | TBD | TBD | Cap `notification-worker`, not `payment-db` |
-| Cache Split-Brain | TBD | TBD | Repair stale `session-cache-replica` |
-| **Pass Rate** | **TBD** | **TBD** | Use strict mode only |
-
-Previously, the SFT model passed the original 3-task strict evaluation. The current 5-task benchmark should be rerun after retraining with the updated SFT data.
 
 ### Expected Plot Assets
 
@@ -367,45 +369,6 @@ For Docker / Hugging Face Space:
 docker build -t cloudsreenv .
 docker run -p 8000:8000 cloudsreenv
 ```
-
----
-
-## Hackathon Judging Alignment
-
-| Criterion | How CloudSREEnv Addresses It | Status |
-|---|---|---|
-| Environment Innovation (40%) | Multi-agent SRE simulator with victim-vs-root-cause traps, dynamic state, and deterministic graders | Strong |
-| Storytelling (30%) | README explains problem, environment, agent workflow, and demo path | Needs final artifact links |
-| Showing Improvement (20%) | BASE vs SFT strict eval, benchmark JSON, and generated README plots | Needs current 5-task rerun |
-| Reward + Pipeline (10%) | Coherent composable reward design plus SFT-first training pipeline | Strong |
-
----
-
-## Submission Checklist
-
-- [ ] Add Hugging Face Space URL.
-- [ ] Add Colab training notebook URL.
-- [ ] Add mini-blog or YouTube video URL.
-- [ ] Rerun SFT training after Task 4/5 additions.
-- [ ] Run strict `BASE` benchmark across all 5 tasks.
-- [ ] Run strict `SFT` benchmark across all 5 tasks.
-- [ ] Run held-out strict benchmark.
-- [ ] Generate final plot images under `assets/`.
-- [x] Confirm `openenv.yaml` lists all 5 tasks.
-- [ ] Confirm Hugging Face Space starts successfully.
-
----
-
-## What You Still Need To Fill
-
-- `TBD: add HF Space URL`
-- `TBD: add Colab URL`
-- `TBD: add HF blog or YouTube URL`
-- `TBD: trained adapter URL if uploaded`
-- BASE strict 5-task results
-- SFT strict 5-task results after retraining
-- Held-out strict results
-- Final plot images in `assets/` after rerunning the 5-task benchmark
 
 ---
 
