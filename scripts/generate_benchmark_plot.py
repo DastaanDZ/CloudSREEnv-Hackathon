@@ -24,7 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BENCHMARK_PATH = Path("/content/CloudSREEnv-Hackathon/episode_traces/benchmark_results.json")
-ASSETS_DIR = ROOT / "assets"
+ASSETS_DIR = Path("/content/CloudSREEnv-Hackathon/assets")
 LOG_DIR = ROOT / "training_logs"
 
 TASK_LABELS = {
