@@ -293,6 +293,9 @@ The plot generator produces:
 - `assets/benchmark_success_comparison.png`
 ![alt text](assets/benchmark_success_comparison.svg)
 
+- `assets/reward_epoch.png`
+![alt text](image.png)
+
 `sft_training_loss.png` shows supervised loss over training steps.  
 `reward_progress.png` shows a training-time SFT reward proxy from Unsloth logs, computed as `exp(-loss)`.
 
