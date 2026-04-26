@@ -199,7 +199,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                         manual_reward -= 0.10
                 elif is_investigation_only:
                     if target == "L2_DB_SME":
-                        manual_reward -= 0.50
+                        manual_reward -= 0.75
+                        if is_blocked_duplicate:
+                            manual_reward -= 0.25
                     elif target == "L1_Triage":
                         manual_reward -= 0.35
                     else:
@@ -236,7 +238,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 if is_after_fix:
                     manual_reward += 0.75
                 elif is_after_investigation and is_investigation_only:
-                    manual_reward += 0.70
+                    manual_reward += 0.90
+                    if is_blocked_duplicate:
+                        manual_reward += 0.25
                 elif has_fixable_l1_evidence:
                     manual_reward -= 0.45
                 elif is_initial_alert:
@@ -323,9 +327,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             if action_type == "RESTART":
                 service_id = action_dict.get("service_id", "")
                 if fix_already_applied:
-                    manual_reward -= 0.45
+                    manual_reward -= 0.65
                     if is_blocked_duplicate:
-                        manual_reward -= 0.25
+                        manual_reward -= 0.35
                 elif service_id in VALID_SERVICES:
                     manual_reward += 0.45
                     if any(kw in prompt_lower for kw in ["crash", "error", "down", "oom", "recover"]):
@@ -342,9 +346,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
                 cpu_value = action_dict.get("cpu_value")
                 
                 if fix_already_applied:
-                    manual_reward -= 0.45
+                    manual_reward -= 0.65
                     if is_blocked_duplicate:
-                        manual_reward -= 0.25
+                        manual_reward -= 0.35
                 elif service_id in VALID_SERVICES and isinstance(cpu_value, int):
                     if cpu_value >= 2048:
                         manual_reward += 0.45
@@ -362,9 +366,9 @@ def sre_rubric_reward(prompts, completions, **kwargs):
             elif action_type == "MESSAGE_CHANNEL":
                 target = action_dict.get("target", "")
                 if fix_already_applied and target == "IC":
-                    manual_reward += 0.50
+                    manual_reward += 0.75
                     if is_blocked_duplicate:
-                        manual_reward += 0.35
+                        manual_reward += 0.45
                 elif not fix_already_applied:
                     manual_reward -= 0.20
                 else:
@@ -673,6 +677,12 @@ def generate_transition_focus_prompts(num_samples: int = 80):
         ),
         (
             "L2_DB_SME",
+            "New message from IC: Restart payment-db.\n"
+            "Obs: [OK] payment-db restarted by L2_DB_SME.\n"
+            "The service is already recovered. Your only valid next step is MESSAGE_CHANNEL to IC.",
+        ),
+        (
+            "L2_DB_SME",
             "New message from IC: Restart payment-db to recover from CrashLoopBackOff.\n"
             "Obs: [OK] payment-db restarted by L2_DB_SME.\n"
             "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
@@ -683,6 +693,12 @@ def generate_transition_focus_prompts(num_samples: int = 80):
             "New message from IC: Scale auth-api to 2048 CPU to resolve latency.\n"
             "Obs: [OK] auth-api scaled to 2048m CPU.\n"
             "Fix already applied. Report completion to IC now.",
+        ),
+        (
+            "L2_DB_SME",
+            "New message from IC: Scale auth-api to 2048 CPU.\n"
+            "Obs: [OK] auth-api scaled to 2048m CPU.\n"
+            "The service is already recovered. Your only valid next step is MESSAGE_CHANNEL to IC.",
         ),
         (
             "L2_DB_SME",
@@ -745,6 +761,19 @@ def generate_transition_focus_prompts(num_samples: int = 80):
             "IC",
             "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.\n"
             "New message from L1_Triage: Root cause is expired upstream TLS certificate on auth-api. No local fix available.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.\n"
+            "New message from L1_Triage: auth-api logs show certificate has expired. No local service restart or scaling can fix it.\n"
+            "This is RCA-only. Close the incident now.",
+        ),
+        (
+            "IC",
+            "INITIAL ALERT:\n[SYSTEM ALERT] Login failures reported across customer-facing authentication flow.\n"
+            "New message from L1_Triage: Root cause is expired upstream TLS certificate on auth-api. No local fix available.\n"
+            "Obs: [BLOCKED] Duplicate action. You already did this. Choose a different action or report findings.\n"
+            "Do not delegate to L2_DB_SME. Close the incident now.",
         ),
     ]
     return [focused[i % len(focused)] for i in range(num_samples)]
