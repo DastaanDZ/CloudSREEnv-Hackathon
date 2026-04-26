@@ -271,6 +271,36 @@ class CloudSREEnv:
         self.scenario_profile = self._build_scenario_profile()
         return Observation(text_output="\n".join(self.cloud.incident_channel))
 
+    def state(self) -> dict:
+        """Return full simulator state for dashboards/debugging, not agent tools."""
+        return {
+            "current_task": self.current_task,
+            "done": self.done,
+            "steps_taken": self.steps_taken,
+            "max_steps": self.max_steps,
+            "services": {
+                svc_id: {
+                    "status": svc.status,
+                    "cpu_allocated": svc.cpu_allocated,
+                    "memory_allocated": svc.memory_allocated,
+                    "latency_ms": svc.latency_ms,
+                    "cache_epoch": svc.cache_epoch,
+                    "error_message": svc.error_message,
+                }
+                for svc_id, svc in self.cloud.services.items()
+            },
+            "incident_state": self.incident_state.model_dump(mode="json"),
+            "scenario_profile": {
+                key: getattr(value, "value", value)
+                for key, value in self.scenario_profile.items()
+            },
+            "action_history": [
+                action.model_dump(mode="json")
+                for action in self.action_history
+            ],
+            "incident_channel": list(self.cloud.incident_channel),
+        }
+
     def step(self, action: Action) -> tuple[Observation, Reward, bool, dict]:
         self.steps_taken += 1
         
@@ -791,6 +821,10 @@ def create_app():
                 "done": done, 
                 "info": info
             })
+
+        @app.get("/state")
+        def api_state():
+            return JSONResponse(env.state())
         
         return app, uvicorn
     except ImportError as e:
